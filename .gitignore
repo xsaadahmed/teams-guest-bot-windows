@@ -12,7 +12,8 @@ windows/test-*.js
 windows/test-*.ps1
 windows/analyze-wav.js
 
-# Portable deployment build artifacts (zip is Git LFS — do not ignore)
+# Portable deployment build artifacts (split parts are committed; monolithic zip is not)
+deployment/TeamsGuestBot-Windows.zip
 deployment/.staging/
 deployment/.cache/
 

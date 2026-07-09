@@ -10,7 +10,7 @@ import { isLocalParticipantMuted } from './localParticipantMute';
  * from the roster — avoids silent recordings when name matching hasn't found the row yet.
  */
 export class RosterMuteTracker {
-  private handle: NodeJS.Timeout | null = null;
+  private handle: ReturnType<typeof setInterval> | null = null;
   private lastMicEnabled: boolean | null = null;
   private nullPollStreak = 0;
 

@@ -15,15 +15,14 @@ projects, rather than Microsoft's official Graph Calling SDK.
   bot, same API, no containers or virtual display needed at all. See
   [`windows/README.md`](windows/README.md).
 
-## Corporate laptop (portable bundle, no internet after clone)
+## Corporate laptop (portable bundle, plain git clone)
 
-For locked-down laptops that **can** `git clone` from GitHub (with Git LFS) but **cannot** reach
-npm, Playwright CDNs, or GitHub Releases in a browser:
+For locked-down laptops that **can** `git clone` from GitHub but **cannot** reach npm,
+Playwright CDNs, Git LFS, or GitHub Releases:
 
 ```cmd
 git clone https://github.com/xsaadahmed/teams-guest-bot-windows
 cd teams-guest-bot-windows
-git lfs pull
 Unpack-Bundle.cmd
 set LOCAL_PARTICIPANT_NAME=Your Teams Display Name
 Start-Bot.cmd
@@ -35,9 +34,10 @@ Then join from a second CMD window:
 curl -X POST http://localhost:3000/join -H "Content-Type: application/json" -d "{\"meetingUrl\":\"YOUR_TEAMS_URL\"}"
 ```
 
-**No Node.js install, no npm install, no `npx playwright install`, and no .NET runtime** are
-required on the corporate laptop. The portable bundle (`deployment/TeamsGuestBot-Windows.zip`,
-stored via Git LFS) includes:
+**No Node.js install, no npm install, no `npx playwright install`, no Git LFS, and no .NET
+runtime** are required on the corporate laptop. The portable bundle lives in
+`deployment/TeamsGuestBot-Windows.zip.*` (split parts under 95 MB each, plain Git files) and
+includes:
 
 - Portable `node.exe`
 - Compiled JavaScript (`build/`)

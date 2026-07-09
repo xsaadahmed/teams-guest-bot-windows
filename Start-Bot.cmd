@@ -3,7 +3,7 @@ setlocal EnableExtensions
 
 REM Entry point for dev machines AND locked-down corporate laptops.
 REM Portable mode: after Unpack-Bundle.cmd (or tar -xf deployment\TeamsGuestBot-Windows.zip)
-REM uses bundled node.exe — no global Node, npm, or internet required.
+REM uses bundled node.exe - no global Node, npm, or internet required.
 
 cd /d "%~dp0"
 
@@ -53,12 +53,12 @@ set "DISMISS=windows\DismissTeamsDialog\publish\DismissTeamsDialog.exe"
 if exist "%HELPER%" (
   echo WASAPI helper: %HELPER%
 ) else (
-  echo WARNING: WASAPI helper not found at %HELPER% — recording will fail.
+  echo WARNING: WASAPI helper not found at %HELPER% - recording will fail.
 )
 if exist "%DISMISS%" (
   echo Dialog dismiss helper: %DISMISS%
 ) else (
-  echo WARNING: Dismiss helper not found at %DISMISS% — ms-teams protocol prompt may appear.
+  echo WARNING: Dismiss helper not found at %DISMISS% - ms-teams protocol prompt may appear.
 )
 
 if not defined RECORDINGS_DIR set "RECORDINGS_DIR=%CD%\Recordings"
@@ -66,10 +66,10 @@ if not exist "%RECORDINGS_DIR%" mkdir "%RECORDINGS_DIR%"
 echo Recordings directory: %RECORDINGS_DIR%
 
 if not defined LOCAL_PARTICIPANT_NAME (
-  echo WARNING: LOCAL_PARTICIPANT_NAME is not set — mic records always-on ^(ignores Teams mute^).
+  echo WARNING: LOCAL_PARTICIPANT_NAME is not set - mic records always-on, ignores Teams mute.
   echo Set it before starting, e.g.: set LOCAL_PARTICIPANT_NAME=Saad Ahmed
 ) else (
-  echo Local participant ^(mute-gated mic^): %LOCAL_PARTICIPANT_NAME%
+  echo Local participant [mute-gated mic]: %LOCAL_PARTICIPANT_NAME%
 )
 
 if not defined PORT set "PORT=3000"

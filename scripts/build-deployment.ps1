@@ -10,7 +10,7 @@
     - Self-contained .NET helper executables
 
   Run on a dev machine with internet, Node, npm, and .NET 8 SDK.
-  The corporate laptop only needs: git clone, git lfs pull, unzip, Start-Bot.cmd.
+  The corporate laptop only needs: git clone, Unpack-Bundle.cmd, Start-Bot.cmd.
 
 .EXAMPLE
   .\scripts\build-deployment.ps1
@@ -25,6 +25,9 @@ $nodeZipUrl = "https://nodejs.org/dist/v$nodeVersion/$nodeZipName"
 $cacheDir = Join-Path $root "deployment\.cache"
 $stagingDir = Join-Path $root "deployment\.staging"
 $outZip = Join-Path $root "deployment\TeamsGuestBot-Windows.zip"
+$splitPrefix = Join-Path $root "deployment\TeamsGuestBot-Windows.zip"
+$manifestPath = Join-Path $root "deployment\TeamsGuestBot-Windows.zip.manifest"
+$chunkBytes = 95 * 1024 * 1024   # stay under GitHub's 100 MB per-file limit
 
 Write-Host "== Building portable Windows deployment bundle ==" -ForegroundColor Cyan
 Write-Host "Project root: $root"
@@ -146,16 +149,64 @@ Invoke-Step "Create zip archive" {
     Compress-Archive -Path (Join-Path $stagingDir "*") -DestinationPath $outZip -CompressionLevel Optimal
 }
 
-$sizeMb = [math]::Round((Get-Item $outZip).Length / 1MB, 1)
+Invoke-Step "Split archive for plain-git commit (95 MB parts)" {
+    Get-ChildItem "$splitPrefix.*" -ErrorAction SilentlyContinue | Remove-Item -Force
+    if (Test-Path $manifestPath) { Remove-Item -Force $manifestPath }
+
+    $inputStream = [System.IO.File]::OpenRead($outZip)
+    $buffer = New-Object byte[] $chunkBytes
+    $partNum = 0
+    try {
+        while ($inputStream.Position -lt $inputStream.Length) {
+            $remaining = [Math]::Min([int64]$chunkBytes, $inputStream.Length - $inputStream.Position)
+            $read = $inputStream.Read($buffer, 0, [int]$remaining)
+            if ($read -le 0) { break }
+
+            $partNum++
+            $partPath = "{0}.{1:D3}" -f $splitPrefix, $partNum
+            $partStream = [System.IO.File]::Create($partPath)
+            try {
+                $partStream.Write($buffer, 0, $read)
+            } finally {
+                $partStream.Close()
+            }
+
+            $partSizeMb = [math]::Round((Get-Item $partPath).Length / 1MB, 2)
+            if ((Get-Item $partPath).Length -gt (100 * 1024 * 1024)) {
+                throw "Part $partPath is ${partSizeMb} MB — exceeds GitHub 100 MB limit."
+            }
+            Write-Host "  Wrote $(Split-Path -Leaf $partPath) ($partSizeMb MB)"
+        }
+    } finally {
+        $inputStream.Close()
+    }
+
+    if ($partNum -eq 0) { throw "Archive split produced zero parts." }
+
+    Remove-Item -Force $outZip
+
+    @(
+        "parts=$partNum"
+        "chunk_bytes=$chunkBytes"
+        "archive=TeamsGuestBot-Windows.zip"
+        "built=$(Get-Date -Format o)"
+    ) | Set-Content -Path $manifestPath -Encoding ascii
+}
+
+$totalMb = 0
+Get-ChildItem "$splitPrefix.*" | ForEach-Object { $totalMb += $_.Length }
+$totalMb = [math]::Round($totalMb / 1MB, 1)
 Write-Host ""
-Write-Host "Built: $outZip ($sizeMb MB)" -ForegroundColor Green
+Write-Host "Built: $partNum split parts ($totalMb MB total) in deployment\" -ForegroundColor Green
+Write-Host "Manifest: deployment\TeamsGuestBot-Windows.zip.manifest"
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  1. git lfs track `"deployment/*.zip`""
-Write-Host "  2. git add deployment/TeamsGuestBot-Windows.zip .gitattributes"
-Write-Host "  3. git commit && git push"
+Write-Host "  git add deployment/"
+Write-Host "  git commit -m `"Update portable deployment bundle (split archive)`""
+Write-Host "  git push"
 Write-Host ""
 Write-Host "Corporate laptop:"
-Write-Host "  git clone ... && cd teams-guest-bot-windows && git lfs pull"
-Write-Host "  tar -xf deployment\TeamsGuestBot-Windows.zip"
+Write-Host "  git clone https://github.com/xsaadahmed/teams-guest-bot-windows"
+Write-Host "  cd teams-guest-bot-windows"
+Write-Host "  Unpack-Bundle.cmd"
 Write-Host "  Start-Bot.cmd"

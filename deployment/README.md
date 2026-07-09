@@ -1,18 +1,20 @@
-# Portable Windows deployment bundle
+# Portable Windows deployment bundle (split archive)
 
-The file `TeamsGuestBot-Windows.zip` in this folder is tracked by **Git LFS**.
+The runtime is shipped as **split zip parts** committed as normal Git files (no Git LFS):
 
-It contains the full offline runtime for locked-down corporate laptops:
+```
+TeamsGuestBot-Windows.zip.001
+TeamsGuestBot-Windows.zip.002
+...
+TeamsGuestBot-Windows.zip.manifest
+```
 
-- Portable `node.exe`
-- Compiled `build/` JavaScript
-- Production `node_modules/` (including Playwright-managed Chromium)
-- Self-contained `WasapiLoopbackRecorder.exe` and `DismissTeamsDialog.exe`
+Each part is under **95 MB** so a plain `git clone` downloads everything.
 
 ## Build (dev machine only)
 
 ```powershell
-.\scripts\build-deployment.ps1
+npm run build:deployment
 ```
 
 ## Corporate laptop
@@ -20,10 +22,9 @@ It contains the full offline runtime for locked-down corporate laptops:
 ```cmd
 git clone https://github.com/xsaadahmed/teams-guest-bot-windows
 cd teams-guest-bot-windows
-git lfs pull
 Unpack-Bundle.cmd
 set LOCAL_PARTICIPANT_NAME=Your Teams Name
 Start-Bot.cmd
 ```
 
-No Node.js install, no npm, no Playwright download, no .NET runtime required after clone + LFS pull + unzip.
+No Git LFS, no npm, no Node install, no Playwright download, no .NET runtime required.
