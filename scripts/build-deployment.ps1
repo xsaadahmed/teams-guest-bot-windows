@@ -30,17 +30,41 @@ Write-Host "== Building portable Windows deployment bundle ==" -ForegroundColor 
 Write-Host "Project root: $root"
 
 function Ensure-DotNet {
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-        $dotnetRoot = Join-Path $env:USERPROFILE ".dotnet"
-        if (Test-Path (Join-Path $dotnetRoot "dotnet.exe")) {
-            $env:DOTNET_ROOT = $dotnetRoot
-            $env:PATH = "$dotnetRoot;$env:PATH"
+    function Test-DotNetSdk([string]$dotnetExe) {
+        if (-not (Test-Path $dotnetExe)) { return $false }
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $version = & $dotnetExe --version 2>$null
+            return ($LASTEXITCODE -eq 0 -and $version)
+        } finally {
+            $ErrorActionPreference = $prevEap
         }
     }
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-        throw ".NET 8 SDK required to build WASAPI/Dismiss helpers. Install from https://dotnet.microsoft.com/download"
+
+    # Prefer per-user install first — PATH often has a broken dotnet stub with no SDK.
+    $candidates = @(
+        (Join-Path $env:USERPROFILE ".dotnet\dotnet.exe"),
+        "${env:ProgramFiles}\dotnet\dotnet.exe"
+    )
+    if (Get-Command dotnet -ErrorAction SilentlyContinue) {
+        $pathDotNet = (Get-Command dotnet).Source
+        if ($pathDotNet -notin $candidates) { $candidates += $pathDotNet }
     }
-    Write-Host ".NET SDK: $(dotnet --version)"
+
+    foreach ($candidate in $candidates) {
+        if (Test-DotNetSdk $candidate) {
+            $dotnetDir = Split-Path -Parent $candidate
+            $env:DOTNET_ROOT = $dotnetDir
+            if ($env:PATH -notlike "*$dotnetDir*") {
+                $env:PATH = "$dotnetDir;$env:PATH"
+            }
+            Write-Host ".NET SDK: $(& $candidate --version) ($candidate)"
+            return
+        }
+    }
+
+    throw ".NET 8 SDK required to build WASAPI/Dismiss helpers. Install from https://dotnet.microsoft.com/download (per-user install to %USERPROFILE%\.dotnet works)."
 }
 
 function Invoke-Step([string]$Label, [scriptblock]$Action) {
