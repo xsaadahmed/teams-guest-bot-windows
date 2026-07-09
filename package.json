@@ -1,0 +1,25 @@
+{
+  "name": "teams-guest-bot",
+  "version": "1.0.0",
+  "description": "Joins a Microsoft Teams meeting as a guest participant (browser automation, like a human would) and records the meeting audio to disk.",
+  "main": "build/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/server.js",
+    "dev": "ts-node src/server.ts",
+    "start:windows": "Start-Bot.cmd",
+    "build:windows-helper": "powershell -ExecutionPolicy Bypass -File windows/build-helper.ps1",
+    "build:deployment": "powershell -ExecutionPolicy Bypass -File scripts/build-deployment.ps1"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@playwright/test": "^1.55.1",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.16.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,31 @@
+node_modules/
+build/
+node/
+PORTABLE-BUNDLE.txt
+Recordings/
+.teams-bot-browser-profile/
+*.log
+.env
+test_stdin.txt
+windows/WasapiLoopbackRecorder/test.wav
+windows/test-*.js
+windows/test-*.ps1
+windows/analyze-wav.js
+
+# Portable deployment build artifacts (zip is Git LFS — do not ignore)
+deployment/.staging/
+deployment/.cache/
+
+# Python transcription venv + caches
+transcribe/.venv/
+__pycache__/
+*.pyc
+
+# .NET build output for the Windows helpers (windows/build-helper.ps1 regenerates these;
+# the self-contained publish/ exes are large and don't belong in git)
+windows/WasapiLoopbackRecorder/bin/
+windows/WasapiLoopbackRecorder/obj/
+windows/WasapiLoopbackRecorder/publish/
+windows/DismissTeamsDialog/bin/
+windows/DismissTeamsDialog/obj/
+windows/DismissTeamsDialog/publish/

@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Builds a small console helper that does exactly one job: WASAPI loopback-capture
+    whatever's playing on the default (or specified) Windows output device to a 16kHz mono
+    WAV file. This is the Windows equivalent of the Linux bot's
+    "ffmpeg -f pulse -i virtual_speaker.monitor" - see src/audioRecorder.windows.ts for how
+    Node drives this.
+
+    Build as a self-contained single-file exe (see ../build-helper.ps1) so the target laptop
+    needs NOTHING installed - no .NET runtime, no admin rights, just this one .exe file.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>WasapiLoopbackRecorder</RootNamespace>
+    <AssemblyName>WasapiLoopbackRecorder</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- This app only makes sense on Windows (WASAPI is a Win32 API) - fail fast and clearly
+         if someone tries to build it for another RID rather than producing a binary that
+         merely throws PlatformNotSupportedException at runtime. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Version pinned to a known-good release as of this writing - run
+         `dotnet add package NAudio` (or check https://www.nuget.org/packages/NAudio) to pick
+         up whatever's current before you rely on this long-term. NAudio is MIT-licensed and
+         has no further dependencies of its own. -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+</Project>

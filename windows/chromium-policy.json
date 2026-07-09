@@ -1,0 +1,4 @@
+{
+  "URLBlocklist": ["msteams:*", "ms-teams:*", "com.microsoft.teams:*"],
+  "ExternalProtocolDialogShowAlwaysOpenCheckbox": false
+}
