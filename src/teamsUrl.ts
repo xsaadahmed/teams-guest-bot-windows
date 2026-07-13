@@ -16,7 +16,15 @@
 export function toDirectJoinUrl(originalLink: string): string {
   try {
     if (originalLink.includes('/v2/?meetingjoin=true')) {
-      // Already in the directly-joinable format.
+      try {
+        const url = new URL(originalLink);
+        if (!url.searchParams.has('suppressPrompt')) {
+          url.searchParams.set('suppressPrompt', 'true');
+          return url.toString();
+        }
+      } catch {
+        // fall through
+      }
       return originalLink;
     }
 
@@ -39,13 +47,14 @@ export function toDirectJoinUrl(originalLink: string): string {
       if (p) hashParams.set('p', p);
       hashParams.set('anon', 'true');
       hashParams.set('webjoin', 'true');
-      return `https://teams.live.com/v2/?meetingjoin=true&webjoin=true#/meet/${meetId}?${hashParams.toString()}`;
+      return `https://teams.live.com/v2/?meetingjoin=true&webjoin=true&suppressPrompt=true#/meet/${meetId}?${hashParams.toString()}`;
     }
 
     if (url.pathname.match(/^\/meet\/[^/]+/) && url.searchParams.has('p')) {
       if (!url.searchParams.has('anon')) {
         url.searchParams.set('anon', 'true');
       }
+      url.searchParams.set('suppressPrompt', 'true');
       return url.toString();
     }
 
@@ -53,6 +62,7 @@ export function toDirectJoinUrl(originalLink: string): string {
       if (!url.searchParams.has('anon')) {
         url.searchParams.set('anon', 'true');
       }
+      url.searchParams.set('suppressPrompt', 'true');
       return url.toString();
     }
 
@@ -63,7 +73,7 @@ export function toDirectJoinUrl(originalLink: string): string {
 
       if (match) {
         const [, threadId, timestamp, context] = match;
-        return `https://teams.microsoft.com/v2/?meetingjoin=true#/l/meetup-join/${threadId}/${timestamp}?context=${context}&anon=true`;
+        return `https://teams.microsoft.com/v2/?meetingjoin=true&suppressPrompt=true#/l/meetup-join/${threadId}/${timestamp}?context=${context}&anon=true&suppressPrompt=true`;
       }
     }
 

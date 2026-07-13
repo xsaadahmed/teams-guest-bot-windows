@@ -76,28 +76,49 @@ function ensureChromiumPolicyFile(): string {
 }
 
 /**
- * Best-effort dismiss of Chromium's native "Open ms-teams.exe?" bubble via Win32 + SendKeys.
+ * Best-effort dismiss of Chromium's native "Open ms-teams.exe?" bubble via DismissTeamsDialog.exe.
  * Playwright keyboard events only reach the page, not browser-chrome dialogs.
  */
-export async function dismissNativeProtocolDialogBestEffort(page?: Page): Promise<void> {
-  if (!IS_WINDOWS) return;
+async function getChromiumPid(page?: Page): Promise<number | undefined> {
+  if (!page) return undefined;
   try {
-    if (page) await page.bringToFront();
+    const cdp = await page.context().newCDPSession(page);
+    const { processId } = (await cdp.send('Browser.getBrowserPID' as never)) as { processId: number };
+    return processId;
   } catch {
-    // page may be navigating
+    return undefined;
   }
-  if (!fs.existsSync(DISMISS_DIALOG_EXE)) return;
-  try {
-    await execFileAsync(DISMISS_DIALOG_EXE, [], { windowsHide: true, timeout: 15_000 });
-  } catch {
-    // dialog may not be present
+}
+
+export async function dismissNativeProtocolDialogBestEffort(page?: Page): Promise<boolean> {
+  if (!IS_WINDOWS) return false;
+  if (!fs.existsSync(DISMISS_DIALOG_EXE)) {
+    console.warn('[browserLaunch] DismissTeamsDialog.exe not found — protocol prompt must be dismissed manually.');
+    return false;
   }
+
+  const pid = await getChromiumPid(page);
+  const attempts: string[][] = pid ? [[String(pid)], []] : [[]];
+
+  for (const args of attempts) {
+    try {
+      await execFileAsync(DISMISS_DIALOG_EXE, args, { windowsHide: true, timeout: 20_000 });
+      console.log(`[browserLaunch] Dismissed native protocol dialog${pid ? ` (chrome pid ${pid})` : ''}.`);
+      return true;
+    } catch (err) {
+      const exitCode = (err as { code?: number | string }).code;
+      if (exitCode === 1 || exitCode === '1') continue;
+      console.warn('[browserLaunch] DismissTeamsDialog failed:', err);
+    }
+  }
+
+  return false;
 }
 
 /** Poll briefly after join — Teams can show the protocol prompt several seconds late. */
 export function startProtocolDialogWatcher(page: Page): () => void {
   if (!IS_WINDOWS) return () => undefined;
-  const delaysMs = [500, 2500, 6000, 12000, 20000, 35000, 50000];
+  const delaysMs = [300, 800, 1500, 3000, 5000, 8000, 12000, 18000, 25000, 35000, 50000];
   const timers: NodeJS.Timeout[] = [];
   for (const delay of delaysMs) {
     timers.push(

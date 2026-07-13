@@ -1,7 +1,7 @@
 import { BrowserContext, Page } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { launchTeamsBrowser, minimizeWindowBestEffort, startProtocolDialogWatcher, dismissNativeProtocolDialogBestEffort } from './browserLaunch';
+import { launchTeamsBrowser, minimizeWindowBestEffort, startProtocolDialogWatcher } from './browserLaunch';
 import { toDirectJoinUrl } from './teamsUrl';
 import { joinTeamsMeeting, leaveTeamsMeeting, hasMeetingEnded, getParticipantCount, ensureRosterPanelOpen } from './teamsJoin';
 import { AudioRecorder } from './audioRecorder';
@@ -252,8 +252,8 @@ export class TeamsGuestBot {
         return;
       }
 
-      // New check: is the bot the only participant left?
-      await dismissNativeProtocolDialogBestEffort(this.page);
+      // Protocol prompt only appears around join time — do not run dismiss helper on every
+      // in-meeting poll; it used to foreground the user's own Teams window.
       const count = await getParticipantCount(this.page);
       if (count !== null) {
         console.log(`[bot] Participant count: ${count}`);
