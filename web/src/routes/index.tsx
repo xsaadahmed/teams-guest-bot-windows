@@ -599,20 +599,36 @@ function useRecorder() {
     };
   }, [mode, paused]);
 
+  // Keep mini/large recorder in sync with the bot — including auto-leave when alone.
+  // Without this, mode stays "recording" after the backend has already left.
   useEffect(() => {
-    if (mode !== "recording") {
+    if (mode !== "recording" && mode !== "saving" && mode !== "joining") {
       setAudioLevel(0);
       return;
     }
     const id = setInterval(() => {
       getBotStatus()
         .then((s) => {
-          if (s.state === "idle") {
-            setMode("saved");
-            joinedAtRef.current = null;
+          if (s.state === "leaving") {
+            // Bot is tearing down (alone-timeout or meeting ended) — show Saving… not Recording.
+            if (mode === "recording" || mode === "joining") {
+              setPaused(false);
+              setMode("saving");
+            }
             setAudioLevel(0);
             return;
           }
+          if (s.state === "idle" || s.state === "error") {
+            if (mode === "recording" || mode === "saving" || mode === "joining") {
+              joinedAtRef.current = null;
+              setPaused(false);
+              setAudioLevel(0);
+              if (s.state === "error" && s.lastError) setError(s.lastError);
+              setMode("saved");
+            }
+            return;
+          }
+          if (mode === "saving") return;
           if (typeof s.paused === "boolean") setPaused(s.paused);
           if (typeof s.localMicOpen === "boolean") setLocalMicOpen(s.localMicOpen);
           setAudioLevel(typeof s.audioLevel === "number" ? s.audioLevel : 0);

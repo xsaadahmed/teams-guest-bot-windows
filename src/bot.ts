@@ -180,38 +180,42 @@ export class TeamsGuestBot {
     }
 
     this.state = 'leaving';
+    this.status = { ...this.status, state: 'leaving' };
     this.recordingPaused = false;
     this.captions.setPaused(false);
     this.stopEndOfMeetingWatcher();
     this.stopMuteTracker();
 
-    // Finalize the captions transcript while the page is still alive (the speaker names live in
-    // the page DOM - once we close the browser they're gone).
-    await this.finalizeTranscript().catch((err) =>
-      console.warn('[bot] error writing transcript (continuing anyway):', err),
-    );
-
-    if (this.page) {
-      await leaveTeamsMeeting(this.page).catch((err) =>
-        console.warn('[bot] error while clicking Leave (continuing anyway):', err),
+    try {
+      // Finalize the captions transcript while the page is still alive (the speaker names live in
+      // the page DOM - once we close the browser they're gone).
+      await this.finalizeTranscript().catch((err) =>
+        console.warn('[bot] error writing transcript (continuing anyway):', err),
       );
+
+      if (this.page) {
+        await leaveTeamsMeeting(this.page).catch((err) =>
+          console.warn('[bot] error while clicking Leave (continuing anyway):', err),
+        );
+      }
+
+      await this.recorder.stop();
+
+      // Only safe to hand off once recorder.stop() above has resolved - that's the point at
+      // which the WAV is guaranteed complete and finalized. (This is also why it's not inside
+      // finalizeTranscript(): that runs earlier, while the page is still open to read captions
+      // from, well before the recording itself has actually stopped.)
+      if (this.recordingFilePath) {
+        autoTranscribeInBackground(this.recordingFilePath);
+      }
+
+      await this.cleanupBrowser();
+    } finally {
+      // Always clear leaving — otherwise auto-leave can leave the UI stuck on "Recording".
+      this.recordingFilePath = null;
+      this.state = 'idle';
+      this.status = { state: 'idle' };
     }
-
-    await this.recorder.stop();
-
-    // Only safe to hand off once recorder.stop() above has resolved - that's the point at
-    // which the WAV is guaranteed complete and finalized. (This is also why it's not inside
-    // finalizeTranscript(): that runs earlier, while the page is still open to read captions
-    // from, well before the recording itself has actually stopped.)
-    if (this.recordingFilePath) {
-      autoTranscribeInBackground(this.recordingFilePath);
-    }
-
-    await this.cleanupBrowser();
-
-    this.recordingFilePath = null;
-    this.state = 'idle';
-    this.status = { state: 'idle' };
     return this.getStatus();
   }
 
