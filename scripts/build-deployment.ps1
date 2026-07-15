@@ -83,6 +83,9 @@ Ensure-DotNet
 
 Invoke-Step "npm ci" { npm ci }
 Invoke-Step "TypeScript compile" { npm run build }
+Invoke-Step "Build web UI" {
+    & (Join-Path $root "scripts\build-web.ps1")
+}
 Invoke-Step "Build .NET helpers" {
     & (Join-Path $root "windows\build-helper.ps1")
 }
@@ -126,6 +129,9 @@ Invoke-Step "Stage bundle contents" {
 
     Copy-Item -Recurse (Join-Path $root "build") (Join-Path $stagingDir "build")
     Copy-Item -Recurse (Join-Path $root "node_modules") (Join-Path $stagingDir "node_modules")
+    if (Test-Path (Join-Path $root "public")) {
+        Copy-Item -Recurse (Join-Path $root "public") (Join-Path $stagingDir "public")
+    }
 
     $wasapiOut = Join-Path $stagingDir "windows\WasapiLoopbackRecorder\publish"
     $dismissOut = Join-Path $stagingDir "windows\DismissTeamsDialog\publish"

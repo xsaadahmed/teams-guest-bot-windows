@@ -425,7 +425,7 @@ async function clickCameraOffInFrame(page: Page): Promise<boolean> {
 
 async function turnOffCameraIfNeeded(page: Page): Promise<void> {
   try {
-    await page.bringToFront();
+    // Do not bringToFront() here — that steals OS focus from the user's meeting client.
     if (await clickCameraOffInFrame(page)) {
       await sleep(500);
       const stillOn = await isCameraOn(page);

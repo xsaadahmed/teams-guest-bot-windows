@@ -30,3 +30,12 @@ windows/WasapiLoopbackRecorder/publish/
 windows/DismissTeamsDialog/bin/
 windows/DismissTeamsDialog/obj/
 windows/DismissTeamsDialog/publish/
+# Web UI (cozy-meet-helper) — source in web/, built output in public/
+web/node_modules/
+web/.output/
+web/.wrangler/
+web/dist/
+web/.tanstack/
+web/.nitro/
+public/
+

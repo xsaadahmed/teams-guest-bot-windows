@@ -29,7 +29,10 @@ export async function isLocalParticipantMuted(page: Page, participantName: strin
           const nameFromTid = tid.startsWith(prefix) ? tid.slice(prefix.length) : '';
 
           const matches =
-            normalize(rowLabel).startsWith(target) || normalize(nameFromTid) === target;
+            normalize(rowLabel).includes(target) ||
+            normalize(nameFromTid).includes(target) ||
+            target.includes(normalize(nameFromTid)) ||
+            normalize(rowLabel).split(',')[0]?.trim() === target;
           if (!matches) continue;
 
           // Most reliable: the mic icon's own data-cid, right on this row.

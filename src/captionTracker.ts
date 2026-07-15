@@ -40,6 +40,7 @@ function sleep(ms: number): Promise<void> {
 export class CaptionTracker {
   private entries = new Map<number, CaptionEntry>();
   private page: Page | null = null;
+  private paused = false;
 
   /**
    * Begins capturing captions. `startEpochMs` should be the same instant recording started, so
@@ -48,6 +49,7 @@ export class CaptionTracker {
   public async start(page: Page, startEpochMs: number): Promise<void> {
     this.page = page;
     this.entries.clear();
+    this.paused = false;
 
     // Must run for EVERY meeting: each /join creates a fresh browser context + page, and an
     // exposed function only lives on the page it was registered on. (A previous version cached
@@ -55,6 +57,7 @@ export class CaptionTracker {
     // The try/catch covers the rare case of start() being called twice on the same page.
     try {
       await page.exposeFunction('__teamsCaption', (ev: RawCaptionEvent) => {
+        if (this.paused) return;
         const existing = this.entries.get(ev.id);
         if (existing) {
           existing.text = ev.text;
@@ -76,6 +79,11 @@ export class CaptionTracker {
 
     await this.enableCaptions(page);
     await this.installObserver(page, startEpochMs);
+  }
+
+  /** While paused, new live-caption events are ignored (nothing added to the transcript). */
+  public setPaused(paused: boolean): void {
+    this.paused = paused;
   }
 
   /** Stops the observer and returns captured lines in chronological order. */

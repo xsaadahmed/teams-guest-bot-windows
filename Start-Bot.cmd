@@ -74,4 +74,5 @@ if not defined LOCAL_PARTICIPANT_NAME (
 
 if not defined PORT set "PORT=3000"
 echo Starting bot server on port %PORT%...
+echo Web UI: http://localhost:%PORT%/
 "%NODE_EXE%" build\server.js

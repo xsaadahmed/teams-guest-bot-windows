@@ -1,7 +1,7 @@
 import { BrowserContext, Page } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { launchTeamsBrowser, minimizeWindowBestEffort, startProtocolDialogWatcher } from './browserLaunch';
+import { launchTeamsBrowser, minimizeWindowBestEffort, startProtocolDialogWatcher, startBackgroundFocusGuard, getChromiumPid } from './browserLaunch';
 import { toDirectJoinUrl } from './teamsUrl';
 import { joinTeamsMeeting, leaveTeamsMeeting, hasMeetingEnded, getParticipantCount, ensureRosterPanelOpen } from './teamsJoin';
 import { AudioRecorder } from './audioRecorder';
@@ -23,6 +23,14 @@ export interface BotStatus {
   recordingFile?: string;
   joinedAt?: string;
   lastError?: string;
+  paused?: boolean;
+  /** Peak meeting audio level 0..1 while recording (for UI sound wave). */
+  audioLevel?: number;
+  /**
+   * Whether the local participant mic is open for capture (false when muted in Teams roster).
+   * UI uses this so the sound wave stays flat while you are muted.
+   */
+  localMicOpen?: boolean;
 }
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(process.cwd(), 'Recordings');
@@ -47,9 +55,18 @@ export class TeamsGuestBot {
   private captionsActive = false;
   private stopProtocolDialogWatcher: (() => void) | null = null;
   private muteTracker: RosterMuteTracker | null = null;
+  private recordingPaused = false;
+  /** Fail-open until mute tracker confirms a muted roster state. */
+  private localMicOpen = true;
 
   public getStatus(): BotStatus {
-    return { ...this.status, state: this.state };
+    return {
+      ...this.status,
+      state: this.state,
+      paused: this.state === 'in_meeting' ? this.recordingPaused : undefined,
+      audioLevel: this.state === 'in_meeting' ? this.recorder.audioLevel : undefined,
+      localMicOpen: this.state === 'in_meeting' ? this.localMicOpen : undefined,
+    };
   }
 
   public async join(req: JoinRequest): Promise<BotStatus> {
@@ -59,15 +76,29 @@ export class TeamsGuestBot {
 
     const displayName = req.displayName?.trim() || DEFAULT_DISPLAY_NAME;
     this.state = 'joining';
+    this.recordingPaused = false;
+    this.localMicOpen = true;
     this.status = { state: 'joining', meetingUrl: req.meetingUrl, displayName };
 
+    // Capture the user's current window BEFORE Chromium launches, park Chromium off-screen,
+    // and keep returning focus so join stays silent (no fullscreen Chromium flash).
+    const focusGuard = startBackgroundFocusGuard();
     try {
       const { context } = await launchTeamsBrowser();
       this.context = context;
       this.page = await context.newPage();
+      focusGuard.setChromePid(await getChromiumPid(this.page));
+      await minimizeWindowBestEffort(context, this.page);
+      focusGuard.poke();
+
+      // Start dismiss watcher BEFORE navigating — the ms-teams protocol prompt appears during join.
+      this.stopProtocolDialogWatcher?.();
+      this.stopProtocolDialogWatcher = startProtocolDialogWatcher(this.page);
 
       const directUrl = toDirectJoinUrl(req.meetingUrl);
       const outcome = await joinTeamsMeeting(this.page, directUrl, displayName);
+      await minimizeWindowBestEffort(context, this.page);
+      focusGuard.poke();
 
       if (outcome.status === 'denied') {
         throw new Error(`Teams denied entry: ${outcome.reason}`);
@@ -78,10 +109,6 @@ export class TeamsGuestBot {
         );
       }
 
-      // Placed after (not before) a confirmed join: the join flow itself (clicking through
-      // the lobby, name field, etc.) is the fragile part, so it runs with a normal visible
-      // window first. Only once we're safely in the meeting do we try to get it out of the
-      // way - and only if MINIMIZE_BROWSER_WINDOW=true, see browserLaunch.ts.
       await minimizeWindowBestEffort(context, this.page);
 
       const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
@@ -89,17 +116,15 @@ export class TeamsGuestBot {
       this.recordingFilePath = filePath;
       this.recorder.start(filePath);
 
-      // Timestamps for captions align with when recording started (before the settle delay below).
       const recordingStartEpoch = Date.now();
       this.captionsActive = false;
 
-      if (this.page) {
-        this.stopProtocolDialogWatcher?.();
-        this.stopProtocolDialogWatcher = startProtocolDialogWatcher(this.page);
-      }
+      // Refresh dismiss polling for any late post-join prompts.
+      this.stopProtocolDialogWatcher?.();
+      this.stopProtocolDialogWatcher = startProtocolDialogWatcher(this.page);
 
-      // Let the in-meeting UI finish loading before opening the captions menu.
       await new Promise((r) => setTimeout(r, 3000));
+      focusGuard.poke();
 
       if (this.page) {
         try {
@@ -117,6 +142,8 @@ export class TeamsGuestBot {
         displayName,
         recordingFile: fileName,
         joinedAt: new Date().toISOString(),
+        paused: false,
+        localMicOpen: this.localMicOpen,
       };
 
       this.startEndOfMeetingWatcher();
@@ -130,7 +157,21 @@ export class TeamsGuestBot {
       this.state = 'error';
       await this.cleanupBrowser();
       throw err;
+    } finally {
+      focusGuard.stop();
     }
+  }
+
+  public async setPaused(paused: boolean): Promise<BotStatus> {
+    if (this.state !== 'in_meeting') {
+      throw new Error(`Can only pause while in a meeting (state=${this.state}).`);
+    }
+    this.recordingPaused = paused;
+    this.recorder.setPaused(paused);
+    this.captions.setPaused(paused);
+    this.status = { ...this.status, paused };
+    console.log(`[bot] Recording ${paused ? 'paused' : 'resumed'} (audio silence + caption skip).`);
+    return this.getStatus();
   }
 
   public async leave(): Promise<BotStatus> {
@@ -139,6 +180,8 @@ export class TeamsGuestBot {
     }
 
     this.state = 'leaving';
+    this.recordingPaused = false;
+    this.captions.setPaused(false);
     this.stopEndOfMeetingWatcher();
     this.stopMuteTracker();
 
@@ -286,7 +329,9 @@ export class TeamsGuestBot {
     if (process.platform !== 'win32' || !LOCAL_PARTICIPANT_NAME || !this.page) return;
 
     this.muteTracker = new RosterMuteTracker(this.page, LOCAL_PARTICIPANT_NAME, (micEnabled) => {
+      this.localMicOpen = micEnabled;
       this.recorder.setMicGate(micEnabled);
+      this.status = { ...this.status, localMicOpen: micEnabled };
     });
     this.muteTracker.start();
   }

@@ -1,5 +1,5 @@
 import { chromium, BrowserContext, Page, Route } from '@playwright/test';
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -90,6 +90,8 @@ async function getChromiumPid(page?: Page): Promise<number | undefined> {
   }
 }
 
+export { getChromiumPid };
+
 export async function dismissNativeProtocolDialogBestEffort(page?: Page): Promise<boolean> {
   if (!IS_WINDOWS) return false;
   if (!fs.existsSync(DISMISS_DIALOG_EXE)) {
@@ -115,10 +117,161 @@ export async function dismissNativeProtocolDialogBestEffort(page?: Page): Promis
   return false;
 }
 
+/** Park Chromium far off-screen (normal window state — NOT minimized). */
+const OFFSCREEN_X = -32000;
+const OFFSCREEN_Y = 0;
+
+/**
+ * Silent join guard: shove Chromium off-screen and return OS focus to the user's window.
+ *
+ * Uses off-screen + windowState=normal (not minimize). Minimized windows set document.hidden
+ * and break Teams roster/mute scraping; an off-screen "normal" window stays invisible to the
+ * user but keeps the page "visible" for WebRTC + UI automation + protocol dismiss.
+ */
+export function startBackgroundFocusGuard(): {
+  setChromePid: (pid: number | undefined) => void;
+  poke: () => void;
+  stop: () => void;
+} {
+  if (!IS_WINDOWS) {
+    return { setChromePid: () => undefined, poke: () => undefined, stop: () => undefined };
+  }
+
+  let savedHwnd = '0';
+  let chromePid = 0;
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  try {
+    const script = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class FgCap {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+"@
+[string][FgCap]::GetForegroundWindow().ToInt64()
+`;
+    savedHwnd = execFileSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 5000,
+    }).trim();
+  } catch (err) {
+    console.warn('[browserLaunch] Could not capture foreground window:', err);
+  }
+
+  const demote = () => {
+    if (!chromePid) return;
+    const script = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class SilentChrome {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int X, int Y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+
+  static uint TargetPid;
+  static int OffX, OffY;
+  static bool EnumCb(IntPtr hWnd, IntPtr lParam) {
+    uint pid = 0;
+    GetWindowThreadProcessId(hWnd, out pid);
+    if (pid != TargetPid || !IsWindowVisible(hWnd)) return true;
+    RECT r;
+    if (!GetWindowRect(hWnd, out r)) return true;
+    int w = r.Right - r.Left, h = r.Bottom - r.Top;
+    if (w < 80 || h < 80) return true;
+    if (r.Left > -10000) {
+      ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE — keep normal, never minimize
+      SetWindowPos(hWnd, (IntPtr)1, OffX, OffY, 0, 0, 0x0001 | 0x0010); // NOSIZE|NOACTIVATE, HWND_BOTTOM
+    }
+    return true;
+  }
+  public static void Park(uint pid, int x, int y) {
+    TargetPid = pid; OffX = x; OffY = y;
+    EnumWindows(EnumCb, IntPtr.Zero);
+  }
+  public static void RestoreFocus(IntPtr target, uint chromePid) {
+    if (target == IntPtr.Zero || !IsWindow(target) || IsIconic(target)) return;
+    IntPtr fg = GetForegroundWindow();
+    uint fgPid = 0;
+    GetWindowThreadProcessId(fg, out fgPid);
+    if (fgPid != chromePid) return;
+    uint ignored = 0;
+    uint foreThread = GetWindowThreadProcessId(fg, out ignored);
+    uint appThread = GetCurrentThreadId();
+    if (foreThread != appThread) AttachThreadInput(appThread, foreThread, true);
+    SetForegroundWindow(target);
+    if (foreThread != appThread) AttachThreadInput(appThread, foreThread, false);
+  }
+}
+"@
+[SilentChrome]::Park([uint32]${chromePid}, ${OFFSCREEN_X}, ${OFFSCREEN_Y})
+[SilentChrome]::RestoreFocus([IntPtr]${savedHwnd}, [uint32]${chromePid})
+`;
+    try {
+      execFile(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        { windowsHide: true, timeout: 4000 },
+        () => undefined,
+      );
+    } catch {
+      // best-effort
+    }
+  };
+
+  return {
+    setChromePid: (pid) => {
+      chromePid = pid && pid > 0 ? pid : 0;
+      if (!chromePid) return;
+      demote();
+      if (!timer) timer = setInterval(demote, 250);
+      setTimeout(demote, 50);
+      setTimeout(demote, 150);
+      setTimeout(demote, 400);
+      setTimeout(demote, 900);
+      setTimeout(demote, 1800);
+      setTimeout(demote, 3500);
+    },
+    poke: demote,
+    stop: () => {
+      // Final shove before letting go — then stop fighting the user if they open it from the taskbar.
+      demote();
+      chromePid = 0;
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+  };
+}
+
+/** @deprecated Alias for startBackgroundFocusGuard. */
+export function startChromiumFocusSuppressor(): {
+  setChromePid: (pid: number | undefined) => void;
+  poke: () => void;
+  stop: () => void;
+} {
+  return startBackgroundFocusGuard();
+}
+
 /** Poll briefly after join — Teams can show the protocol prompt several seconds late. */
 export function startProtocolDialogWatcher(page: Page): () => void {
   if (!IS_WINDOWS) return () => undefined;
-  const delaysMs = [300, 800, 1500, 3000, 5000, 8000, 12000, 18000, 25000, 35000, 50000];
+  const delaysMs = [0, 200, 500, 1000, 2000, 3500, 5000, 8000, 12000, 18000, 25000, 35000, 50000];
   const timers: NodeJS.Timeout[] = [];
   for (const delay of delaysMs) {
     timers.push(
@@ -213,7 +366,8 @@ function buildLaunchArgs(width: number, height: number): string[] {
   const policyFile = ensureChromiumPolicyFile();
   const args = [
     `--window-size=${width},${height}`,
-    '--window-position=0,0',
+    // Start already off-screen so the first paint doesn't flash over the user's UI.
+    `--window-position=${OFFSCREEN_X},${OFFSCREEN_Y}`,
     '--lang=en-US',
 
     // Audio: make sure autoplay isn't blocked (Teams plays remote audio via an actual
@@ -246,6 +400,7 @@ function buildLaunchArgs(width: number, height: number): string[] {
   if (!IS_WINDOWS) {
     args.push('--no-sandbox', '--disable-setuid-sandbox', '--use-pulseaudio');
   }
+  // Off-screen (not minimized): silent for the user, but page stays "visible" for Teams.
 
   return args;
 }
@@ -291,25 +446,28 @@ export async function launchTeamsBrowser(): Promise<LaunchedBrowser> {
 }
 
 /**
- * Best-effort, Windows-only, OFF BY DEFAULT: minimizes the Chromium window via CDP so it
- * doesn't sit on top of whatever the person is actually doing on their laptop. There's no
- * Xvfb-style "invisible display" option on Windows - the bot's window is a real window on
- * the real desktop unless something like this hides it.
- *
- * Left disabled until it's been verified on real hardware: Chrome can throttle timers in
- * minimized/hidden *windows* for power saving, and while it deliberately does NOT do this
- * for background *tabs* carrying an active WebRTC call, it isn't confirmed here whether a
- * minimized window gets the same exemption. Enable with MINIMIZE_BROWSER_WINDOW=true once
- * you've confirmed captions keep updating and the recording stays gap-free with it on.
+ * Park Chromium off-screen (normal state). Always on for Windows so join stays silent.
+ * Set KEEP_BROWSER_VISIBLE=true to leave the window on-screen for debugging.
+ * (True minimize sets document.hidden and breaks roster/mute — we never use that.)
  */
 export async function minimizeWindowBestEffort(context: BrowserContext, page: Page): Promise<void> {
-  if (!IS_WINDOWS || process.env.MINIMIZE_BROWSER_WINDOW !== 'true') return;
+  if (!IS_WINDOWS) return;
+  if (process.env.KEEP_BROWSER_VISIBLE === 'true' || process.env.KEEP_BROWSER_VISIBLE === '1') return;
   try {
     const cdp = await context.newCDPSession(page);
     const { windowId } = await cdp.send('Browser.getWindowForTarget');
-    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
-    console.log('[browserLaunch] Minimized the browser window.');
+    await cdp.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: {
+        left: OFFSCREEN_X,
+        top: OFFSCREEN_Y,
+        width: Number(process.env.X11_WIDTH ?? 1280),
+        height: Number(process.env.X11_HEIGHT ?? 720),
+        windowState: 'normal',
+      },
+    });
+    console.log('[browserLaunch] Parked Chromium off-screen (silent join).');
   } catch (err) {
-    console.warn('[browserLaunch] Could not minimize window (continuing with it visible):', err);
+    console.warn('[browserLaunch] Could not park Chromium off-screen:', err);
   }
 }

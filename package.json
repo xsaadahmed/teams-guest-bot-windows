@@ -5,6 +5,8 @@
   "main": "build/server.js",
   "scripts": {
     "build": "tsc",
+    "build:web": "powershell -ExecutionPolicy Bypass -File scripts/build-web.ps1",
+    "build:all": "npm run build && npm run build:web",
     "start": "node build/server.js",
     "dev": "ts-node src/server.ts",
     "start:windows": "Start-Bot.cmd",

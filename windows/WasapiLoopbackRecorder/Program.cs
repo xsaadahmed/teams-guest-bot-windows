@@ -33,7 +33,8 @@ namespace WasapiLoopbackRecorder
     ///                                              [--no-mic] [--mic-gated]
     /// Control: write "STOP" to stdin (or close it). With --mic-gated, also accepts
     /// "MIC 0" / "MIC 1" to close/open the mic contribution while loopback continues.
-    /// Prints "READY" when capture has started.
+    /// "PAUSE 1" / "PAUSE 0" silences all streams (writes zeros) while keeping the WAV clock.
+    /// Prints "READY" when capture has started, and periodic "LEVEL &lt;0-1&gt;" amplitude lines.
     /// </summary>
     internal static class Program
     {
@@ -138,10 +139,14 @@ namespace WasapiLoopbackRecorder
             }
 
             int micGateOpen = 1;
+            int recordingPaused = 0;
+            long lastLevelTick = 0;
+            float pendingPeak = 0f;
             if (micSession != null && micGated)
             {
                 Console.Error.WriteLine("[wasapi] Mic capture is mute-gated (open by default; send MIC 0 on stdin to silence while muted).");
             }
+            Console.Error.WriteLine("[wasapi] Pause via stdin: PAUSE 1 / PAUSE 0 (writes silence; LEVEL lines report meeting+mic amplitude).");
 
             var allSessions = new List<CaptureSession>(loopbackSessions);
             if (micSession != null) allSessions.Add(micSession);
@@ -150,6 +155,40 @@ namespace WasapiLoopbackRecorder
             var finalizeGate = new object();
             bool finalized = false;
             int pendingStops = allSessions.Count;
+
+            void EmitLevel(float peak)
+            {
+                // Accumulate max across loopback + mic callbacks within the throttle window.
+                if (peak > pendingPeak) pendingPeak = peak;
+                long now = Environment.TickCount64;
+                if (now - Volatile.Read(ref lastLevelTick) < 100) return;
+                Volatile.Write(ref lastLevelTick, now);
+                float clamped = pendingPeak < 0f ? 0f : (pendingPeak > 1f ? 1f : pendingPeak);
+                pendingPeak = 0f;
+                Console.WriteLine($"LEVEL {clamped:F3}");
+            }
+
+            static float PeakFromBuffer(byte[] buffer, int bytesRecorded, WaveFormat format)
+            {
+                float peak = 0f;
+                if (format.Encoding == WaveFormatEncoding.IeeeFloat)
+                {
+                    for (int i = 0; i + 3 < bytesRecorded; i += 4)
+                    {
+                        float sample = Math.Abs(BitConverter.ToSingle(buffer, i));
+                        if (sample > peak) peak = sample;
+                    }
+                }
+                else if (format.BitsPerSample == 16)
+                {
+                    for (int i = 0; i + 1 < bytesRecorded; i += 2)
+                    {
+                        float sample = Math.Abs(BitConverter.ToInt16(buffer, i) / 32768f);
+                        if (sample > peak) peak = sample;
+                    }
+                }
+                return peak;
+            }
 
             void OnStreamStopped(CaptureSession session, StoppedEventArgs a)
             {
@@ -174,10 +213,30 @@ namespace WasapiLoopbackRecorder
             foreach (var session in allSessions)
             {
                 bool isMicSession = micSession != null && ReferenceEquals(session, micSession);
+                bool isLoopback = !isMicSession;
                 session.Capture.DataAvailable += (_, a) =>
                 {
                     if (a.BytesRecorded <= 0) return;
                     session.Writer ??= new WaveFileWriter(session.TempPath, session.Capture.WaveFormat);
+
+                    if (Volatile.Read(ref recordingPaused) != 0)
+                    {
+                        session.Writer.Write(new byte[a.BytesRecorded], 0, a.BytesRecorded);
+                        if (isLoopback) EmitLevel(0f);
+                        return;
+                    }
+
+                    float peak = PeakFromBuffer(a.Buffer, a.BytesRecorded, session.Capture.WaveFormat);
+                    if (isLoopback)
+                    {
+                        EmitLevel(peak);
+                    }
+                    else if (!(micGated && Volatile.Read(ref micGateOpen) == 0))
+                    {
+                        // Your own voice is only on the mic path (loopback never includes it).
+                        EmitLevel(peak);
+                    }
+
                     if (isMicSession && micGated && Volatile.Read(ref micGateOpen) == 0)
                     {
                         session.Writer.Write(new byte[a.BytesRecorded], 0, a.BytesRecorded);
@@ -231,6 +290,19 @@ namespace WasapiLoopbackRecorder
                 if (trimmed.Equals("MIC 1", StringComparison.OrdinalIgnoreCase))
                 {
                     Volatile.Write(ref micGateOpen, 1);
+                    continue;
+                }
+                if (trimmed.Equals("PAUSE 1", StringComparison.OrdinalIgnoreCase) ||
+                    trimmed.Equals("PAUSE", StringComparison.OrdinalIgnoreCase))
+                {
+                    Volatile.Write(ref recordingPaused, 1);
+                    EmitLevel(0f);
+                    continue;
+                }
+                if (trimmed.Equals("PAUSE 0", StringComparison.OrdinalIgnoreCase) ||
+                    trimmed.Equals("RESUME", StringComparison.OrdinalIgnoreCase))
+                {
+                    Volatile.Write(ref recordingPaused, 0);
                     continue;
                 }
             }

@@ -29,6 +29,14 @@ export class AudioRecorder implements IAudioRecorder {
     this.impl.setMicGate?.(enabled);
   }
 
+  public setPaused(paused: boolean): void {
+    this.impl.setPaused?.(paused);
+  }
+
+  public get audioLevel(): number {
+    return this.impl.audioLevel ?? 0;
+  }
+
   public get isRecording(): boolean {
     return this.impl.isRecording;
   }

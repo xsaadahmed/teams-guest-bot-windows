@@ -17,6 +17,7 @@ export class WindowsAudioRecorder implements IAudioRecorder {
   private helper: ChildProcessWithoutNullStreams | null = null;
   private readonly helperPath: string;
   private readonly micGated: boolean;
+  private level = 0;
 
   constructor(helperPath?: string) {
     this.helperPath =
@@ -24,6 +25,10 @@ export class WindowsAudioRecorder implements IAudioRecorder {
       process.env.WASAPI_HELPER_PATH ||
       path.join(__dirname, '..', 'windows', 'WasapiLoopbackRecorder', 'publish', 'WasapiLoopbackRecorder.exe');
     this.micGated = Boolean(process.env.LOCAL_PARTICIPANT_NAME?.trim()) && process.env.WASAPI_NO_MIC !== 'true';
+  }
+
+  public get audioLevel(): number {
+    return this.level;
   }
 
   public start(filePath: string): void {
@@ -54,14 +59,25 @@ export class WindowsAudioRecorder implements IAudioRecorder {
       helperArgs.push('--mic-gated');
     }
 
+    this.level = 0;
     console.log(`[audioRecorder] Starting: ${this.helperPath} ${helperArgs.map((a) => `"${a}"`).join(' ')}`);
     this.helper = spawn(this.helperPath, helperArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
 
     this.helper.stdout.on('data', (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      console.log('[audioRecorder][wasapi]', text);
-      if (this.micGated && text.includes('READY')) {
-        this.setMicGate(true);
+      const text = chunk.toString();
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const levelMatch = /^LEVEL\s+([0-9.]+)$/i.exec(trimmed);
+        if (levelMatch) {
+          const value = Number(levelMatch[1]);
+          if (Number.isFinite(value)) this.level = Math.min(1, Math.max(0, value));
+          continue;
+        }
+        console.log('[audioRecorder][wasapi]', trimmed);
+        if (this.micGated && trimmed.includes('READY')) {
+          this.setMicGate(true);
+        }
       }
     });
     this.helper.stderr.on('data', (chunk: Buffer) => {
@@ -71,11 +87,13 @@ export class WindowsAudioRecorder implements IAudioRecorder {
     this.helper.on('exit', (code, signal) => {
       console.log(`[audioRecorder] WASAPI helper exited (code=${code}, signal=${signal})`);
       this.helper = null;
+      this.level = 0;
     });
 
     this.helper.on('error', (err) => {
       console.error('[audioRecorder] Failed to start WASAPI helper:', err);
       this.helper = null;
+      this.level = 0;
     });
   }
 
@@ -87,6 +105,17 @@ export class WindowsAudioRecorder implements IAudioRecorder {
       proc.stdin.write(`MIC ${enabled ? 1 : 0}\n`);
     } catch (err) {
       console.warn('[audioRecorder] Could not write mic gate command:', err);
+    }
+  }
+
+  public setPaused(paused: boolean): void {
+    const proc = this.helper;
+    if (!proc?.stdin.writable) return;
+    try {
+      proc.stdin.write(`PAUSE ${paused ? 1 : 0}\n`);
+      if (paused) this.level = 0;
+    } catch (err) {
+      console.warn('[audioRecorder] Could not write pause command:', err);
     }
   }
 

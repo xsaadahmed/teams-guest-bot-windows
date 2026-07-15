@@ -17,5 +17,14 @@ export interface IAudioRecorder {
   /** Windows mute-gated mic only: open/close hardware mic contribution to the mix. */
   setMicGate?(enabled: boolean): void;
 
+  /**
+   * Pause/resume capture. While paused, the recorder should keep the timeline (write silence)
+   * but not record real meeting/mic audio.
+   */
+  setPaused?(paused: boolean): void;
+
+  /** Latest peak meeting-audio level in 0..1 (Windows WASAPI only). */
+  readonly audioLevel?: number;
+
   readonly isRecording: boolean;
 }
