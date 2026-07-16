@@ -1,7 +1,14 @@
 import { BrowserContext, Page } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { launchTeamsBrowser, minimizeWindowBestEffort, startProtocolDialogWatcher, startBackgroundFocusGuard, getChromiumPid } from './browserLaunch';
+import {
+  launchTeamsBrowser,
+  minimizeWindowBestEffort,
+  startProtocolDialogWatcher,
+  startBackgroundFocusGuard,
+  startManualBrowserRestoreWatcher,
+  getChromiumPid,
+} from './browserLaunch';
 import { toDirectJoinUrl } from './teamsUrl';
 import { joinTeamsMeeting, leaveTeamsMeeting, hasMeetingEnded, getParticipantCount, ensureRosterPanelOpen } from './teamsJoin';
 import { AudioRecorder } from './audioRecorder';
@@ -54,6 +61,7 @@ export class TeamsGuestBot {
   private recordingFilePath: string | null = null;
   private captionsActive = false;
   private stopProtocolDialogWatcher: (() => void) | null = null;
+  private stopManualBrowserRestoreWatcher: (() => void) | null = null;
   private muteTracker: RosterMuteTracker | null = null;
   private recordingPaused = false;
   /** Fail-open until mute tracker confirms a muted roster state. */
@@ -148,6 +156,8 @@ export class TeamsGuestBot {
 
       this.startEndOfMeetingWatcher();
       this.startMuteTracker();
+      this.stopManualBrowserRestoreWatcher?.();
+      this.stopManualBrowserRestoreWatcher = startManualBrowserRestoreWatcher(this.page);
 
       return this.getStatus();
     } catch (err) {
@@ -274,6 +284,8 @@ export class TeamsGuestBot {
   private async cleanupBrowser(): Promise<void> {
     this.stopProtocolDialogWatcher?.();
     this.stopProtocolDialogWatcher = null;
+    this.stopManualBrowserRestoreWatcher?.();
+    this.stopManualBrowserRestoreWatcher = null;
     try {
       await this.context?.close();
     } catch (err) {

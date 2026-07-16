@@ -5,23 +5,28 @@ export type UiWindowLayout = {
   height: number;
   /** Distance from left screen edge (px). */
   left?: number;
-  /** Distance from bottom screen edge (px). */
+  /** Absolute Y from top of screen (px). Takes precedence over `bottom` when set. */
+  top?: number;
+  /** Distance from bottom screen edge (px). Used only when `top` is omitted. */
   bottom?: number;
   /** Keep above other apps (Teams-style floating control). */
   topmost?: boolean;
 };
 
 /**
- * Positions the Edge/Chrome "Meeting Assistant" app window at bottom-left and optionally
- * pins it HWND_TOPMOST. Uses SWP_NOACTIVATE so it does not steal keyboard focus.
+ * Positions the Edge/Chrome "Meeting Assistant" app window.
+ * Uses SWP_NOACTIVATE so it does not steal keyboard focus.
+ * Prefer absolute `top` when restoring the full window; use `bottom` for the overlay.
  */
 export function applyUiWindowLayout(layout: UiWindowLayout): void {
   if (process.platform !== 'win32') return;
 
-  const left = layout.left ?? 8;
-  const bottom = layout.bottom ?? 8;
-  const topmost = layout.topmost !== false ? 1 : 0;
+  const left = Number.isFinite(layout.left) ? Math.round(layout.left as number) : 8;
+  const topmost = layout.topmost === true ? 1 : 0;
   const { width, height } = layout;
+  const hasTop = layout.top != null && Number.isFinite(layout.top);
+  const top = hasTop ? Math.round(layout.top as number) : -1;
+  const bottom = Number.isFinite(layout.bottom) ? Math.round(layout.bottom as number) : 8;
 
   const script = `
 Add-Type @"
@@ -34,38 +39,95 @@ public class UiWin {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int X, int Y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
   public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+  public static readonly IntPtr HWND_TOP = new IntPtr(0);
   public const uint SWP_NOACTIVATE = 0x0010;
   public const uint SWP_SHOWWINDOW = 0x0040;
-  public static List<long> Find(string needle) {
+  public const uint SWP_FRAMECHANGED = 0x0020;
+
+  static bool TitleMatch(string t) {
+    if (string.IsNullOrEmpty(t)) return false;
+    return t.IndexOf("Meeting Assi", StringComparison.OrdinalIgnoreCase) >= 0
+        || t.IndexOf("e& Meeting", StringComparison.OrdinalIgnoreCase) >= 0
+        || t.IndexOf("localhost:3000", StringComparison.OrdinalIgnoreCase) >= 0
+        || t.IndexOf("127.0.0.1:3000", StringComparison.OrdinalIgnoreCase) >= 0;
+  }
+
+  static bool IsChromeFamily(string cls) {
+    return cls.IndexOf("Chrome_WidgetWin", StringComparison.OrdinalIgnoreCase) >= 0
+        || cls.IndexOf("Chrome_WindowImpl", StringComparison.OrdinalIgnoreCase) >= 0;
+  }
+
+  public static List<long> FindCandidates() {
     var list = new List<long>();
     EnumWindows((h, _) => {
       if (!IsWindowVisible(h)) return true;
-      var sb = new StringBuilder(512);
-      GetWindowText(h, sb, sb.Capacity);
-      var t = sb.ToString();
-      if (t.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) list.Add(h.ToInt64());
+      var title = new StringBuilder(512);
+      GetWindowText(h, title, title.Capacity);
+      var t = title.ToString();
+      if (!TitleMatch(t)) return true;
+      var cls = new StringBuilder(256);
+      GetClassName(h, cls, cls.Capacity);
+      // Prefer real browser top-level windows; still accept title match as fallback.
+      list.Add(h.ToInt64());
       return true;
     }, IntPtr.Zero);
     return list;
   }
+
+  public static long PreferForeground(List<long> ids) {
+    if (ids == null || ids.Count == 0) return 0;
+    IntPtr fg = GetForegroundWindow();
+    long fgId = fg.ToInt64();
+    foreach (var id in ids) {
+      if (id == fgId) return id;
+    }
+    // Foreground might be our Edge app even if title enum missed it — use FG when Chrome-like.
+    if (fg != IntPtr.Zero) {
+      var cls = new StringBuilder(256);
+      GetClassName(fg, cls, cls.Capacity);
+      var title = new StringBuilder(512);
+      GetWindowText(fg, title, title.Capacity);
+      if (IsChromeFamily(cls.ToString()) && (TitleMatch(title.ToString()) || ids.Count == 0))
+        return fgId;
+    }
+    // Pick the window that is already closest to our target size, else first.
+    return ids[0];
+  }
 }
 "@
-$w = ${width}; $h = ${height}; $left = ${left}; $bottom = ${bottom}; $topmost = ${topmost}
+$w = ${width}; $h = ${height}; $left = ${left}; $bottom = ${bottom}; $top = ${top}; $topmost = ${topmost}
 $screenH = [UiWin]::GetSystemMetrics(1)
-$y = [Math]::Max(0, $screenH - $h - $bottom)
-$ids = [UiWin]::Find("Meeting Assi")
-if ($ids.Count -eq 0) { $ids = [UiWin]::Find("localhost:3000") }
-$after = if ($topmost -eq 1) { [UiWin]::HWND_TOPMOST } else { [UiWin]::HWND_NOTOPMOST }
-$flags = [UiWin]::SWP_NOACTIVATE -bor [UiWin]::SWP_SHOWWINDOW
-foreach ($id in $ids) {
-  $hw = [IntPtr]$id
-  [void][UiWin]::SetWindowPos($hw, $after, $left, $y, $w, $h, $flags)
+if ($top -ge 0) { $y = $top } else { $y = [Math]::Max(0, $screenH - $h - $bottom) }
+$ids = [UiWin]::FindCandidates()
+$target = [UiWin]::PreferForeground($ids)
+if ($target -eq 0) {
+  # Last resort: if foreground is an Edge/Chrome window, move that.
+  $fg = [UiWin]::GetForegroundWindow()
+  if ($fg -ne [IntPtr]::Zero) {
+    $cls = New-Object System.Text.StringBuilder 256
+    [void][UiWin]::GetClassName($fg, $cls, $cls.Capacity)
+    if ($cls.ToString() -match 'Chrome_WidgetWin') { $target = $fg.ToInt64() }
+  }
 }
-Write-Output ("moved:" + $ids.Count)
+if ($target -eq 0) { Write-Output "moved:0"; return }
+$after = if ($topmost -eq 1) { [UiWin]::HWND_TOPMOST } else { [UiWin]::HWND_NOTOPMOST }
+$flags = [UiWin]::SWP_NOACTIVATE -bor [UiWin]::SWP_SHOWWINDOW -bor [UiWin]::SWP_FRAMECHANGED
+$hw = [IntPtr]$target
+# Clear/set topmost and resize in two steps — more reliable on Edge --app windows.
+[void][UiWin]::SetWindowPos($hw, $after, $left, $y, $w, $h, $flags)
+if ($topmost -eq 0) {
+  # Ensure we are not stuck always-on-top (fixes Alt+Tab feeling "locked").
+  [void][UiWin]::SetWindowPos($hw, [UiWin]::HWND_NOTOPMOST, $left, $y, $w, $h, $flags)
+}
+Write-Output ("moved:1 hwnd=" + $target + " topmost=" + $topmost + " " + $w + "x" + $h + "@" + $left + "," + $y)
 `;
 
   execFile(

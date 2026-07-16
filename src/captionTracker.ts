@@ -111,7 +111,7 @@ export class CaptionTracker {
 
       const names = await page.evaluate(() => {
         const set = new Set<string>();
-        document.querySelectorAll('li[data-cid="roster-participant"]').forEach((node) => {
+        document.querySelectorAll('[data-cid="roster-participant"]').forEach((node) => {
           // Try both span[title] and the accessible label
           const title =
             node.querySelector('span[title]')?.getAttribute('title') ?? node.getAttribute('aria-label');

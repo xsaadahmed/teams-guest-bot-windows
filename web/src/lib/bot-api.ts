@@ -15,6 +15,8 @@ export interface BotStatus {
 export interface RecordingItem {
   fileName: string;
   sizeBytes: number;
+  /** Rounded whole seconds from WAV header; null if unknown. */
+  durationSeconds?: number | null;
   lastModified: string;
 }
 
@@ -71,6 +73,8 @@ export function positionUiWindow(opts: {
   width: number;
   height: number;
   left?: number;
+  /** Absolute Y from top of screen (prefer this when restoring the full window). */
+  top?: number;
   bottom?: number;
   topmost?: boolean;
 }): Promise<{ ok: boolean }> {

@@ -471,3 +471,83 @@ export async function minimizeWindowBestEffort(context: BrowserContext, page: Pa
     console.warn('[browserLaunch] Could not park Chromium off-screen:', err);
   }
 }
+
+/**
+ * If the user intentionally activates Chromium from the taskbar while it's parked off-screen,
+ * move it back on-screen so it is actually usable. This does not fight the user; it only
+ * restores when Chromium is already the foreground window and still parked at the off-screen
+ * sentinel position.
+ */
+export function startManualBrowserRestoreWatcher(page: Page): () => void {
+  if (!IS_WINDOWS) return () => undefined;
+  if (process.env.KEEP_BROWSER_VISIBLE === 'true' || process.env.KEEP_BROWSER_VISIBLE === '1') {
+    return () => undefined;
+  }
+
+  let stopped = false;
+
+  const width = Number(process.env.X11_WIDTH ?? 1280);
+  const height = Number(process.env.X11_HEIGHT ?? 720);
+  const restoreX = Number(process.env.BROWSER_RESTORE_X ?? 80);
+  const restoreY = Number(process.env.BROWSER_RESTORE_Y ?? 80);
+
+  const tryRestore = () => {
+    if (stopped) return;
+    const script = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class RestoreChrome {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int X, int Y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+  public const uint SWP_NOACTIVATE = 0x0010;
+  public const uint SWP_SHOWWINDOW = 0x0040;
+  public const uint SWP_FRAMECHANGED = 0x0020;
+}
+"@
+$restoreX = ${restoreX}
+$restoreY = ${restoreY}
+$w = ${width}
+$h = ${height}
+$fg = [RestoreChrome]::GetForegroundWindow()
+if ($fg -eq [IntPtr]::Zero) { return }
+$cls = New-Object System.Text.StringBuilder 256
+[void][RestoreChrome]::GetClassName($fg, $cls, $cls.Capacity)
+if ($cls.ToString() -notmatch 'Chrome_WidgetWin') { return }
+$rect = New-Object RestoreChrome+RECT
+if (-not [RestoreChrome]::GetWindowRect($fg, [ref]$rect)) { return }
+if ($rect.Left -gt -10000) { return }
+[RestoreChrome]::ShowWindow($fg, 4) | Out-Null
+[RestoreChrome]::SetWindowPos(
+  $fg,
+  [RestoreChrome]::HWND_NOTOPMOST,
+  $restoreX,
+  $restoreY,
+  $w,
+  $h,
+  [RestoreChrome]::SWP_NOACTIVATE -bor [RestoreChrome]::SWP_SHOWWINDOW -bor [RestoreChrome]::SWP_FRAMECHANGED
+) | Out-Null
+`;
+    execFile(
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { windowsHide: true, timeout: 3000 },
+      () => undefined,
+    );
+  };
+
+  const timer = setInterval(tryRestore, 1000);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}

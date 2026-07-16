@@ -109,8 +109,9 @@ app.post('/resume', async (_req: Request, res: Response) => {
 });
 
 /**
- * Positions the Meeting Assistant Edge/Chrome window (bottom-left + optional always-on-top).
- * Body: { width, height, left?, bottom?, topmost? }
+ * Positions the Meeting Assistant Edge/Chrome window.
+ * Body: { width, height, left?, top?, bottom?, topmost? }
+ * `topmost` defaults to false — must be explicitly true for the mini overlay.
  */
 app.post('/ui/window', (req: Request, res: Response) => {
   const width = Number(req.body?.width);
@@ -122,11 +123,31 @@ app.post('/ui/window', (req: Request, res: Response) => {
     width: Math.round(width),
     height: Math.round(height),
     left: req.body?.left != null ? Number(req.body.left) : undefined,
+    top: req.body?.top != null ? Number(req.body.top) : undefined,
     bottom: req.body?.bottom != null ? Number(req.body.bottom) : undefined,
-    topmost: req.body?.topmost !== false,
+    topmost: req.body?.topmost === true || req.body?.topmost === 'true',
   });
   res.json({ ok: true });
 });
+
+/** Best-effort PCM WAV duration from the standard 44-byte header (our WASAPI writer). */
+function wavDurationSeconds(filePath: string, sizeBytes: number): number | null {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(44);
+    const read = fs.readSync(fd, header, 0, 44, 0);
+    fs.closeSync(fd);
+    if (read < 44) return null;
+    if (header.toString('ascii', 0, 4) !== 'RIFF') return null;
+    if (header.toString('ascii', 8, 12) !== 'WAVE') return null;
+    const byteRate = header.readUInt32LE(28);
+    if (!byteRate || byteRate <= 0) return null;
+    const payload = Math.max(0, sizeBytes - 44);
+    return payload / byteRate;
+  } catch {
+    return null;
+  }
+}
 
 /** Lists recordings currently on disk, newest first. */
 app.get('/recordings', (_req: Request, res: Response) => {
@@ -138,8 +159,15 @@ app.get('/recordings', (_req: Request, res: Response) => {
     .readdirSync(RECORDINGS_DIR)
     .filter((f) => f.endsWith('.wav'))
     .map((f) => {
-      const stat = fs.statSync(path.join(RECORDINGS_DIR, f));
-      return { fileName: f, sizeBytes: stat.size, lastModified: stat.mtime };
+      const filePath = path.join(RECORDINGS_DIR, f);
+      const stat = fs.statSync(filePath);
+      const durationSeconds = wavDurationSeconds(filePath, stat.size);
+      return {
+        fileName: f,
+        sizeBytes: stat.size,
+        durationSeconds: durationSeconds != null ? Math.round(durationSeconds) : null,
+        lastModified: stat.mtime,
+      };
     })
     .sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
 
