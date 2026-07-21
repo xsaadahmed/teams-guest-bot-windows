@@ -9,7 +9,7 @@ services:
     environment:
       - ENABLE_VNC=true
       - VNC_PASSWORD=debug
-      - DEFAULT_DISPLAY_NAME=Meeting Recorder
+      - DEFAULT_DISPLAY_NAME=e& Assistant
     # Recommended by Playwright's own Docker docs: avoids zombie processes and
     # Chromium running out of shared memory and crashing mid-meeting.
     init: true

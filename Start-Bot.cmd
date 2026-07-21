@@ -65,11 +65,10 @@ if not defined RECORDINGS_DIR set "RECORDINGS_DIR=%CD%\Recordings"
 if not exist "%RECORDINGS_DIR%" mkdir "%RECORDINGS_DIR%"
 echo Recordings directory: %RECORDINGS_DIR%
 
-if not defined LOCAL_PARTICIPANT_NAME (
-  echo WARNING: LOCAL_PARTICIPANT_NAME is not set - mic records always-on, ignores Teams mute.
-  echo Set it before starting, e.g.: set LOCAL_PARTICIPANT_NAME=Saad Ahmed
-) else (
+if defined LOCAL_PARTICIPANT_NAME (
   echo Local participant [mute-gated mic]: %LOCAL_PARTICIPANT_NAME%
+) else (
+  echo Local participant name: not set in env — Web UI will ask on first open ^(saved to .teams-bot-config.json^)
 )
 
 if not defined PORT set "PORT=3000"

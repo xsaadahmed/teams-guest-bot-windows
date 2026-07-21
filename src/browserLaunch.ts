@@ -152,7 +152,7 @@ public class FgCap {
 "@
 [string][FgCap]::GetForegroundWindow().ToInt64()
 `;
-    savedHwnd = execFileSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+    savedHwnd = execFileSync('powershell', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', script], {
       encoding: 'utf8',
       windowsHide: true,
       timeout: 5000,
@@ -224,7 +224,7 @@ public class SilentChrome {
     try {
       execFile(
         'powershell',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', script],
         { windowsHide: true, timeout: 4000 },
         () => undefined,
       );
@@ -366,7 +366,8 @@ function buildLaunchArgs(width: number, height: number): string[] {
   const policyFile = ensureChromiumPolicyFile();
   const args = [
     `--window-size=${width},${height}`,
-    // Start already off-screen so the first paint doesn't flash over the user's UI.
+    // Start off-screen so join stays silent (no focus steal when user hits Record).
+    // Join/chat use DOM + CDP clicks/typing — no need for an on-screen window.
     `--window-position=${OFFSCREEN_X},${OFFSCREEN_Y}`,
     '--lang=en-US',
 
@@ -472,6 +473,28 @@ export async function minimizeWindowBestEffort(context: BrowserContext, page: Pa
   }
 }
 
+/** Move Chromium back into a normal on-screen rect (needed before Playwright can click chat UI). */
+export async function bringWindowOnScreenBestEffort(context: BrowserContext, page: Page): Promise<void> {
+  if (!IS_WINDOWS) return;
+  try {
+    const cdp = await context.newCDPSession(page);
+    const { windowId } = await cdp.send('Browser.getWindowForTarget');
+    await cdp.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: {
+        left: Number(process.env.BROWSER_RESTORE_X ?? 80),
+        top: Number(process.env.BROWSER_RESTORE_Y ?? 80),
+        width: Number(process.env.X11_WIDTH ?? 1280),
+        height: Number(process.env.X11_HEIGHT ?? 720),
+        windowState: 'normal',
+      },
+    });
+    console.log('[browserLaunch] Brought Chromium on-screen (for chat / interaction).');
+  } catch (err) {
+    console.warn('[browserLaunch] Could not bring Chromium on-screen:', err);
+  }
+}
+
 /**
  * If the user intentionally activates Chromium from the taskbar while it's parked off-screen,
  * move it back on-screen so it is actually usable. This does not fight the user; it only
@@ -539,7 +562,7 @@ if ($rect.Left -gt -10000) { return }
 `;
     execFile(
       'powershell',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', script],
       { windowsHide: true, timeout: 3000 },
       () => undefined,
     );

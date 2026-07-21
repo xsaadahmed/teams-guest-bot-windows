@@ -50,10 +50,34 @@ export function getBotStatus(): Promise<BotStatus> {
   return api<BotStatus>("/status");
 }
 
-export function joinMeeting(meetingUrl: string, displayName: string): Promise<BotStatus> {
+export interface BotConfig {
+  localParticipantName: string;
+  botDisplayName: string;
+}
+
+export function getBotConfig(): Promise<BotConfig> {
+  return api<BotConfig>("/config");
+}
+
+export function saveBotConfig(localParticipantName: string): Promise<BotConfig> {
+  return api<BotConfig>("/config", {
+    method: "PUT",
+    body: JSON.stringify({ localParticipantName }),
+  });
+}
+
+export function joinMeeting(
+  meetingUrl: string,
+  displayName = "e& Assistant",
+  opts?: { announceRecordingInChat?: boolean },
+): Promise<BotStatus> {
   return api<BotStatus>("/join", {
     method: "POST",
-    body: JSON.stringify({ meetingUrl, displayName }),
+    body: JSON.stringify({
+      meetingUrl,
+      displayName,
+      announceRecordingInChat: opts?.announceRecordingInChat !== false,
+    }),
   });
 }
 

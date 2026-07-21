@@ -104,8 +104,16 @@ public class UiWin {
 }
 "@
 $w = ${width}; $h = ${height}; $left = ${left}; $bottom = ${bottom}; $top = ${top}; $topmost = ${topmost}
-$screenH = [UiWin]::GetSystemMetrics(1)
-if ($top -ge 0) { $y = $top } else { $y = [Math]::Max(0, $screenH - $h - $bottom) }
+# Use the working area (excludes taskbar) so the overlay sits on the visible bottom of the screen.
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+$wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+if ($top -ge 0) {
+  $y = $top
+  $x = $left
+} else {
+  $x = $wa.Left + $left
+  $y = [Math]::Max($wa.Top, $wa.Bottom - $h - $bottom)
+}
 $ids = [UiWin]::FindCandidates()
 $target = [UiWin]::PreferForeground($ids)
 if ($target -eq 0) {
@@ -122,25 +130,29 @@ $after = if ($topmost -eq 1) { [UiWin]::HWND_TOPMOST } else { [UiWin]::HWND_NOTO
 $flags = [UiWin]::SWP_NOACTIVATE -bor [UiWin]::SWP_SHOWWINDOW -bor [UiWin]::SWP_FRAMECHANGED
 $hw = [IntPtr]$target
 # Clear/set topmost and resize in two steps — more reliable on Edge --app windows.
-[void][UiWin]::SetWindowPos($hw, $after, $left, $y, $w, $h, $flags)
+[void][UiWin]::SetWindowPos($hw, $after, $x, $y, $w, $h, $flags)
 if ($topmost -eq 0) {
   # Ensure we are not stuck always-on-top (fixes Alt+Tab feeling "locked").
-  [void][UiWin]::SetWindowPos($hw, [UiWin]::HWND_NOTOPMOST, $left, $y, $w, $h, $flags)
+  [void][UiWin]::SetWindowPos($hw, [UiWin]::HWND_NOTOPMOST, $x, $y, $w, $h, $flags)
 }
-Write-Output ("moved:1 hwnd=" + $target + " topmost=" + $topmost + " " + $w + "x" + $h + "@" + $left + "," + $y)
+Write-Output ("moved:1 hwnd=" + $target + " topmost=" + $topmost + " " + $w + "x" + $h + "@" + $x + "," + $y)
 `;
 
-  execFile(
-    'powershell',
-    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
-    { windowsHide: true, timeout: 8000 },
-    (err, stdout) => {
-      if (err) {
-        console.warn('[uiWindow] Could not position UI window:', err.message);
-        return;
-      }
-      const out = String(stdout || '').trim();
-      if (out) console.log('[uiWindow]', out);
-    },
-  );
+  try {
+    execFile(
+      'powershell',
+      ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { windowsHide: true, timeout: 8000 },
+      (err, stdout) => {
+        if (err) {
+          console.warn('[uiWindow] Could not position UI window:', err.message);
+          return;
+        }
+        const out = String(stdout || '').trim();
+        if (out) console.log('[uiWindow]', out);
+      },
+    );
+  } catch (err) {
+    console.warn('[uiWindow] Could not spawn PowerShell for window layout:', (err as Error).message);
+  }
 }

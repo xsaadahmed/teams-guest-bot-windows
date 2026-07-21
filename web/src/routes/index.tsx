@@ -24,6 +24,7 @@ import {
 import { toast } from "sonner";
 import {
   fetchTranscript,
+  getBotConfig,
   getBotStatus,
   joinMeeting,
   leaveMeeting,
@@ -34,6 +35,7 @@ import {
   positionUiWindow,
   recordingDownloadUrl,
   recordingPlayUrl,
+  saveBotConfig,
   type RecordingItem,
   type TranscriptItem,
 } from "../lib/bot-api";
@@ -97,9 +99,10 @@ export const Route = createFileRoute("/")({
 
 type Page = "home" | "recording" | "notes" | "recordings" | "summaries" | "info";
 
-const OVERLAY_EXPANDED = { width: 280, height: 168 };
-const OVERLAY_COLLAPSED = { width: 280, height: 72 };
-const OVERLAY_MARGIN = { left: 8, bottom: 8 };
+// Outer window size must fit Edge title bar + app chrome + recorder controls (tight).
+const OVERLAY_EXPANDED = { width: 280, height: 188 };
+const OVERLAY_COLLAPSED = { width: 280, height: 84 };
+const OVERLAY_MARGIN = { left: 12, bottom: 12 };
 
 type WindowGeometry = { width: number; height: number; x: number; y: number };
 
@@ -129,17 +132,22 @@ function normalizeMainGeometry(g: WindowGeometry | null): WindowGeometry {
 
 function placeOverlayWindow(collapsed: boolean) {
   const size = collapsed ? OVERLAY_COLLAPSED : OVERLAY_EXPANDED;
-  const y = Math.max(0, window.screen.availHeight - size.height - OVERLAY_MARGIN.bottom);
+  // avail* excludes the taskbar — keep the mini UI on the visible bottom-left.
+  const availLeft = window.screen.availLeft ?? 0;
+  const availTop = window.screen.availTop ?? 0;
+  const availH = window.screen.availHeight;
+  const left = availLeft + OVERLAY_MARGIN.left;
+  const top = availTop + Math.max(0, availH - size.height - OVERLAY_MARGIN.bottom);
   try {
     window.resizeTo(size.width, size.height);
-    window.moveTo(OVERLAY_MARGIN.left, y);
+    window.moveTo(left, top);
   } catch {
     // Edge --app often ignores resizeTo/moveTo; Win32 path below is the real resize.
   }
   void positionUiWindow({
     ...size,
-    left: OVERLAY_MARGIN.left,
-    bottom: OVERLAY_MARGIN.bottom,
+    left,
+    top,
     topmost: true,
   }).catch(() => undefined);
 }
@@ -185,6 +193,9 @@ function Index() {
   const [theme, setTheme] = useState<Theme>(() =>
     typeof document !== "undefined" ? resolveTheme() : "light",
   );
+  const [namePromptOpen, setNamePromptOpen] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [nameSaving, setNameSaving] = useState(false);
   const recorder = useRecorder();
   const savedGeometry = useRef<WindowGeometry | null>(null);
   const pendingOverlay = useRef(false);
@@ -193,6 +204,36 @@ function Index() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  // First open: ask for the user's Teams display name (mute gating).
+  useEffect(() => {
+    getBotConfig()
+      .then((cfg) => {
+        if (!cfg.localParticipantName.trim()) {
+          setNameDraft("");
+          setNamePromptOpen(true);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const saveLocalName = async () => {
+    const trimmed = nameDraft.trim();
+    if (!trimmed) {
+      toast.error("Enter your name exactly as it appears in Teams.");
+      return;
+    }
+    setNameSaving(true);
+    try {
+      await saveBotConfig(trimmed);
+      setNamePromptOpen(false);
+      toast.success(`Saved as "${trimmed}"`);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setNameSaving(false);
+    }
+  };
 
   // On first load of the full UI, ensure we are not stuck HWND_TOPMOST (blocks Alt+Tab feel).
   useEffect(() => {
@@ -277,23 +318,65 @@ function Index() {
   }
 
   return shell(
-    <SidebarProvider open={!collapsed} onOpenChange={(open) => setCollapsed(!open)} defaultOpen={false}>
-      <AppSidebar
-        page={page}
-        setPage={setPage}
-        theme={theme}
-        onToggleTheme={() => setTheme((t) => toggleTheme(t))}
-      />
-      <SidebarInset className="flex min-h-0 flex-1 flex-col overflow-auto">
-        {page === "home" && <HomePage setPage={setPage} />}
-        {page === "recording" && <RecordingPage />}
-        {page === "notes" && <NotesPage setPage={setPage} />}
-        {page === "recordings" && <RecordingsPage setPage={setPage} />}
-        {page === "summaries" && <SummariesPage setPage={setPage} />}
-        {page === "info" && <AboutPage />}
-      </SidebarInset>
-      <DockedMeetingAssistant chromeCollapsed={page === "recording"} />
-    </SidebarProvider>,
+    <>
+      <Dialog open={namePromptOpen} onOpenChange={() => undefined}>
+        <DialogContent
+          className="sm:max-w-md [&>button.absolute]:hidden"
+          onPointerDownOutside={(e) => e.preventDefault()}
+          onEscapeKeyDown={(e) => e.preventDefault()}
+        >
+          <DialogHeader>
+            <DialogTitle>What’s your Teams name?</DialogTitle>
+            <DialogDescription>
+              Enter your name exactly as it appears in the meeting roster. We use this so your mic
+              is muted in recordings when you mute in Teams.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="local-participant-name">Display name</Label>
+            <Input
+              id="local-participant-name"
+              autoFocus
+              placeholder="e.g. Saad Ahmed"
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void saveLocalName();
+              }}
+            />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button disabled={nameSaving || !nameDraft.trim()} onClick={() => void saveLocalName()}>
+              {nameSaving ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Saving…
+                </>
+              ) : (
+                "Continue"
+              )}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <SidebarProvider open={!collapsed} onOpenChange={(open) => setCollapsed(!open)} defaultOpen={false}>
+        <AppSidebar
+          page={page}
+          setPage={setPage}
+          theme={theme}
+          onToggleTheme={() => setTheme((t) => toggleTheme(t))}
+        />
+        <SidebarInset className="flex min-h-0 flex-1 flex-col overflow-auto">
+          {page === "home" && <HomePage setPage={setPage} />}
+          {page === "recording" && <RecordingPage />}
+          {page === "notes" && <NotesPage setPage={setPage} />}
+          {page === "recordings" && <RecordingsPage setPage={setPage} />}
+          {page === "summaries" && <SummariesPage setPage={setPage} />}
+          {page === "info" && <AboutPage />}
+        </SidebarInset>
+        <DockedMeetingAssistant chromeCollapsed={page === "recording"} />
+      </SidebarProvider>
+    </>,
   );
 }
 
@@ -1318,6 +1401,10 @@ function useRecorderContext() {
 function useRecorder() {
   const [url, setUrl] = useState("");
   const [accurate, setAccurate] = useState(() => localStorage.getItem("whisperPref") === "1");
+  // Default on; remembered so the slider matches the last Record choice.
+  const [announceInChat, setAnnounceInChat] = useState(
+    () => localStorage.getItem("announceRecordingInChat") !== "0",
+  );
   const [mode, setMode] = useState<Mode>("idle");
   const [paused, setPaused] = useState(false);
   const [seconds, setSeconds] = useState(0);
@@ -1333,6 +1420,10 @@ function useRecorder() {
   useEffect(() => {
     localStorage.setItem("whisperPref", accurate ? "1" : "0");
   }, [accurate]);
+
+  useEffect(() => {
+    localStorage.setItem("announceRecordingInChat", announceInChat ? "1" : "0");
+  }, [announceInChat]);
 
   useEffect(() => {
     getBotStatus()
@@ -1478,9 +1569,20 @@ function useRecorder() {
   const join = async (): Promise<boolean> => {
     if (!url.trim()) return false;
     setError(null);
+    try {
+      const cfg = await getBotConfig();
+      if (!cfg.localParticipantName.trim()) {
+        toast.error("Set your Teams display name first (required for mute-aware recording).");
+        return false;
+      }
+    } catch {
+      // config endpoint unavailable — still attempt join
+    }
     setMode("joining");
     try {
-      const status = await joinMeeting(url.trim(), "Meeting Bot");
+      const status = await joinMeeting(url.trim(), "e& Assistant", {
+        announceRecordingInChat: announceInChat,
+      });
       let confirmed = status;
       if (confirmed.state !== "in_meeting") {
         for (let i = 0; i < 30; i++) {
@@ -1545,6 +1647,8 @@ function useRecorder() {
     setUrl,
     accurate,
     setAccurate,
+    announceInChat,
+    setAnnounceInChat,
     mode,
     paused,
     setPaused,
@@ -1625,6 +1729,35 @@ function RecorderPanel({ size = "mini", overlay = false }: { size?: "mini" | "la
               <TooltipContent side="top" className="max-w-[220px] text-center">
                 Will take longer to transcribe and generate summaries and use more RAM and CPU once the
                 meeting ends
+              </TooltipContent>
+            </Tooltip>
+          </div>
+
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <Switch
+                id="announce-in-chat"
+                checked={r.announceInChat}
+                onCheckedChange={r.setAnnounceInChat}
+                className={compact ? "scale-90 origin-left" : undefined}
+              />
+              <Label
+                htmlFor="announce-in-chat"
+                className={cn("cursor-pointer", compact ? "text-[11px]" : "text-xs")}
+              >
+                Announce recording in chat
+              </Label>
+            </div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" className={compact ? "h-7 w-7 shrink-0" : "h-8 w-8 shrink-0"}>
+                  <Info className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
+                  <span className="sr-only">Chat announce info</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-[220px] text-center">
+                When on, posts &quot;This meeting is being recorded&quot; in the Teams meeting chat after
+                joining. Turn off to skip chat entirely.
               </TooltipContent>
             </Tooltip>
           </div>
@@ -1879,7 +2012,12 @@ function MeetingAssistantWindow({
       </div>
 
       {!minimized && (
-        <CardContent className={cn("px-3 pt-1", fillWindow ? "pb-2" : "pb-3")}>
+        <CardContent
+          className={cn(
+            "px-3 pt-1",
+            fillWindow ? "flex flex-1 flex-col justify-center pb-2" : "pb-3",
+          )}
+        >
           <RecorderPanel size="mini" overlay={fillWindow} />
         </CardContent>
       )}

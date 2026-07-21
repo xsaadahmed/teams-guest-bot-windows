@@ -7,20 +7,29 @@ import {
   startProtocolDialogWatcher,
   startBackgroundFocusGuard,
   startManualBrowserRestoreWatcher,
-  getChromiumPid,
 } from './browserLaunch';
 import { toDirectJoinUrl } from './teamsUrl';
-import { joinTeamsMeeting, leaveTeamsMeeting, hasMeetingEnded, getParticipantCount, ensureRosterPanelOpen } from './teamsJoin';
+import {
+  joinTeamsMeeting,
+  leaveTeamsMeeting,
+  hasMeetingEnded,
+  getParticipantCount,
+  ensureRosterPanelOpen,
+  postRecordingNoticeInChat,
+} from './teamsJoin';
 import { AudioRecorder } from './audioRecorder';
 import { CaptionTracker, CaptionEntry } from './captionTracker';
 import { autoTranscribeInBackground } from './autoTranscribe';
 import { RosterMuteTracker } from './rosterMuteTracker';
+import { getLocalParticipantName } from './userConfig';
 
 export type BotState = 'idle' | 'joining' | 'in_meeting' | 'leaving' | 'error';
 
 export interface JoinRequest {
   meetingUrl: string;
   displayName?: string;
+  /** When true, post "This meeting is being recorded" in Teams chat after join. */
+  announceRecordingInChat?: boolean;
 }
 
 export interface BotStatus {
@@ -41,8 +50,7 @@ export interface BotStatus {
 }
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(process.cwd(), 'Recordings');
-const DEFAULT_DISPLAY_NAME = process.env.DEFAULT_DISPLAY_NAME || 'Meeting Recorder';
-const LOCAL_PARTICIPANT_NAME = process.env.LOCAL_PARTICIPANT_NAME?.trim() || '';
+const DEFAULT_DISPLAY_NAME = process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant';
 
 /**
  * Owns a single guest "session" in a Teams meeting: one browser context, one page,
@@ -88,16 +96,14 @@ export class TeamsGuestBot {
     this.localMicOpen = true;
     this.status = { state: 'joining', meetingUrl: req.meetingUrl, displayName };
 
-    // Capture the user's current window BEFORE Chromium launches, park Chromium off-screen,
-    // and keep returning focus so join stays silent (no fullscreen Chromium flash).
+    // Silent join: Chromium stays off-screen (launch args + park). Do NOT bring it to the
+    // foreground — that steals focus when the user hits Record. Chat typing uses CDP.
     const focusGuard = startBackgroundFocusGuard();
     try {
       const { context } = await launchTeamsBrowser();
       this.context = context;
       this.page = await context.newPage();
-      focusGuard.setChromePid(await getChromiumPid(this.page));
       await minimizeWindowBestEffort(context, this.page);
-      focusGuard.poke();
 
       // Start dismiss watcher BEFORE navigating — the ms-teams protocol prompt appears during join.
       this.stopProtocolDialogWatcher?.();
@@ -105,8 +111,9 @@ export class TeamsGuestBot {
 
       const directUrl = toDirectJoinUrl(req.meetingUrl);
       const outcome = await joinTeamsMeeting(this.page, directUrl, displayName);
+      // Prefer the page that actually completed join (Teams sometimes opens a new tab).
+      if (outcome.page) this.page = outcome.page;
       await minimizeWindowBestEffort(context, this.page);
-      focusGuard.poke();
 
       if (outcome.status === 'denied') {
         throw new Error(`Teams denied entry: ${outcome.reason}`);
@@ -116,8 +123,6 @@ export class TeamsGuestBot {
           'Timed out waiting to be let into the meeting (organizer may not have admitted the bot from the lobby).',
         );
       }
-
-      await minimizeWindowBestEffort(context, this.page);
 
       const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
       const filePath = path.join(RECORDINGS_DIR, fileName);
@@ -132,7 +137,6 @@ export class TeamsGuestBot {
       this.stopProtocolDialogWatcher = startProtocolDialogWatcher(this.page);
 
       await new Promise((r) => setTimeout(r, 3000));
-      focusGuard.poke();
 
       if (this.page) {
         try {
@@ -154,10 +158,36 @@ export class TeamsGuestBot {
         localMicOpen: this.localMicOpen,
       };
 
+      focusGuard.stop();
+
+      const announceInChat = req.announceRecordingInChat !== false;
+      if (announceInChat) {
+        // Let the in-meeting toolbar finish rendering, then chat BEFORE People/mute tracking.
+        // Teams only shows one side panel — roster open during compose kills the send.
+        console.log('[bot] Waiting 6s before posting recording chat notice…');
+        await new Promise((r) => setTimeout(r, 6_000));
+
+        if (this.page) {
+          try {
+            // Stay off-screen — postRecordingNoticeInChat uses DOM clicks + CDP insertText.
+            await postRecordingNoticeInChat(this.page);
+          } catch (err) {
+            console.warn('[bot] recording chat notice failed (continuing):', err);
+          }
+        }
+      } else {
+        console.log('[bot] Skipping recording chat notice (disabled by user).');
+      }
+
+      // Now safe to open the People panel for mute gating + alone detection.
       this.startEndOfMeetingWatcher();
       this.startMuteTracker();
       this.stopManualBrowserRestoreWatcher?.();
       this.stopManualBrowserRestoreWatcher = startManualBrowserRestoreWatcher(this.page);
+
+      if (this.page && this.context) {
+        await minimizeWindowBestEffort(this.context, this.page);
+      }
 
       return this.getStatus();
     } catch (err) {
@@ -340,11 +370,12 @@ export class TeamsGuestBot {
     }
   }
 
-  /** Gates hardware mic capture to match Teams roster mute for LOCAL_PARTICIPANT_NAME. */
+  /** Gates hardware mic capture to match Teams roster mute for the configured local name. */
   private startMuteTracker(): void {
-    if (process.platform !== 'win32' || !LOCAL_PARTICIPANT_NAME || !this.page) return;
+    const localName = getLocalParticipantName();
+    if (process.platform !== 'win32' || !localName || !this.page) return;
 
-    this.muteTracker = new RosterMuteTracker(this.page, LOCAL_PARTICIPANT_NAME, (micEnabled) => {
+    this.muteTracker = new RosterMuteTracker(this.page, localName, (micEnabled) => {
       this.localMicOpen = micEnabled;
       this.recorder.setMicGate(micEnabled);
       this.status = { ...this.status, localMicOpen: micEnabled };

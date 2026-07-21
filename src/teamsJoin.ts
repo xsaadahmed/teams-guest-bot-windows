@@ -253,9 +253,9 @@ async function clickPreJoinControl(page: Page, text: string): Promise<boolean> {
           document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'),
         );
         for (const el of candidates) {
-          const visible = (el as HTMLElement).offsetParent !== null;
-          const content = (el.textContent || (el as HTMLInputElement).value || '').trim();
-          if (visible && content === label) {
+          // Don't require offsetParent — off-screen / opacity tricks can make that null.
+          const content = (el.textContent || (el as HTMLInputElement).value || '').replace(/\s+/g, ' ').trim();
+          if (content === label || content.includes(label)) {
             (el as HTMLElement).click();
             return true;
           }
@@ -271,12 +271,12 @@ async function clickPreJoinControl(page: Page, text: string): Promise<boolean> {
   try {
     const byRole = page.getByRole('button', { name: text });
     if ((await byRole.count()) > 0) {
-      await byRole.first().click({ timeout: 2000 });
+      await byRole.first().evaluate((el) => (el as HTMLElement).click());
       return true;
     }
     const byLink = page.getByRole('link', { name: text });
     if ((await byLink.count()) > 0) {
-      await byLink.first().click({ timeout: 2000 });
+      await byLink.first().evaluate((el) => (el as HTMLElement).click());
       return true;
     }
   } catch {
@@ -489,12 +489,16 @@ async function countInMeetingSignals(page: Page): Promise<number> {
 }
 
 export type JoinOutcome =
-  | { status: 'joined' }
-  | { status: 'denied'; reason: string }
-  | { status: 'timeout' };
+  | { status: 'joined'; page?: Page }
+  | { status: 'denied'; reason: string; page?: Page }
+  | { status: 'timeout'; page?: Page };
 
 function isTeamsMarketingPage(url: string): boolean {
   return /teams\.live\.com\/free(?:\/|$|\?)/i.test(url);
+}
+
+function isLauncherPage(url: string): boolean {
+  return /\/dl\/launcher\//i.test(url) || /launcher\.html/i.test(url);
 }
 
 /** Re-navigate only if Chromium landed on the Teams Free marketing home, not intermediate launcher pages. */
@@ -504,6 +508,23 @@ async function ensureNotOnMarketingPage(page: Page, joinUrl: string): Promise<vo
   console.log(`[teamsJoin] On marketing page (${url}), navigating to ${joinUrl}`);
   await page.goto(joinUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
   await sleep(1000);
+}
+
+/** Prefer a tab that has join UI if Teams opened a second tab (common with dl/launcher). */
+async function pickActiveJoinPage(seed: Page): Promise<Page> {
+  const context = seed.context();
+  const pages = context.pages().filter((p) => !p.isClosed());
+  for (const p of pages) {
+    try {
+      const url = p.url();
+      if (isLauncherPage(url) || /\/meet\//i.test(url) || /light-meetings/i.test(url) || /meetingjoin/i.test(url)) {
+        return p;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return seed;
 }
 
 /**
@@ -518,33 +539,55 @@ export async function joinTeamsMeeting(
   maxWaitMs = 5 * 60_000,
 ): Promise<JoinOutcome> {
   console.log(`[teamsJoin] Opening ${joinUrl}`);
-  await page.goto(joinUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  try {
+    await page.goto(joinUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  } catch (err) {
+    console.warn('[teamsJoin] Initial navigation warning (continuing):', (err as Error).message);
+  }
   await dismissNativeProtocolDialogBestEffort(page);
   await ensureNotOnMarketingPage(page, joinUrl);
+  page = await pickActiveJoinPage(page);
+  console.log(`[teamsJoin] Active page: ${page.url()}`);
 
   // Click through whichever pre-join variant Teams shows us. These appear in different orders/
   // combinations depending on Teams' current experiment bucket, so we just keep checking for a
   // while rather than assuming a fixed sequence.
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 40; i++) {
+    page = await pickActiveJoinPage(page);
     await ensureNotOnMarketingPage(page, joinUrl);
     await dismissNativeProtocolDialogBestEffort(page);
     await dismissNativeAppPromptIfPresent(page);
-    if (await clickPreJoinControl(page, 'Continue on this browser')) {
-      console.log('[teamsJoin] Clicked "Continue on this browser"');
-      await dismissNativeProtocolDialogBestEffort(page);
-      await sleep(800);
+
+    // Scan every open tab — launcher often lands on a different page than the one we navigated.
+    let continued = false;
+    for (const p of page.context().pages()) {
+      if (p.isClosed()) continue;
+      if (await clickPreJoinControl(p, 'Continue on this browser')) {
+        console.log(`[teamsJoin] Clicked "Continue on this browser" (${p.url()})`);
+        page = p;
+        continued = true;
+        await dismissNativeProtocolDialogBestEffort(page);
+        await sleep(800);
+        break;
+      }
     }
+    if (!continued && isLauncherPage(page.url()) && i % 5 === 4) {
+      console.log(`[teamsJoin] Still on launcher (${page.url()}) — retrying Continue…`);
+    }
+
     if (await clickPreJoinControl(page, 'Continue without audio or video')) {
       console.log('[teamsJoin] Clicked "Continue without audio or video"');
       await sleep(1000);
     }
-    if (await clickButtonWithText(page, 'Join now', 1, false)) {
+    if (await clickButtonWithTextAnywhere(page, 'Join now', false)) {
       // It's present - move on to the name-entry step below rather than clicking it yet
       // (we need to type the display name into the field on this same screen first).
       break;
     }
-    await sleep(400);
+    await sleep(500);
   }
+
+  page = await pickActiveJoinPage(page);
 
   try {
     await typeDisplayName(page, displayName);
@@ -574,22 +617,345 @@ export async function joinTeamsMeeting(
   // either we're clearly in, clearly denied, or we time out.
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
+    page = await pickActiveJoinPage(page);
     await ensureNotOnMarketingPage(page, joinUrl);
+
+    // Keep dismissing the launcher if Teams bounced us back.
+    for (const p of page.context().pages()) {
+      if (p.isClosed()) continue;
+      if (await clickPreJoinControl(p, 'Continue on this browser')) {
+        console.log('[teamsJoin] Clicked "Continue on this browser" (post-join wait)');
+        page = p;
+        await sleep(800);
+      }
+    }
 
     const denialReason = await checkDenied(page);
     if (denialReason) {
-      return { status: 'denied', reason: denialReason };
+      return { status: 'denied', reason: denialReason, page };
     }
 
     const signals = await countInMeetingSignals(page);
     if (signals >= IN_MEETING_THRESHOLD) {
-      return { status: 'joined' };
+      return { status: 'joined', page };
     }
 
     await sleep(2000);
   }
 
-  return { status: 'timeout' };
+  return { status: 'timeout', page };
+}
+
+const RECORDING_NOTICE = 'This meeting is being recorded';
+
+const CHAT_BUTTON_SELECTORS = [
+  // Toolbar Chat next to People — prefer exact matches only (fuzzy "*Chat*" hits overflow/menus).
+  '#chat-button',
+  'button#chat-button',
+  'button[aria-label="Chat"]',
+  'button[data-tid="chat-button"]',
+  'button[id="chat-button"]',
+];
+
+/** Overflow ("…") only if the toolbar Chat button is hidden on this layout. */
+const MORE_BUTTON_SELECTORS = [
+  'button[aria-label="More"]',
+  'button[aria-label="More actions"]',
+  'button[aria-label*="More" i]',
+  '#callingButtons-showMoreBtn',
+  'button[data-tid="callingButtons-showMoreBtn"]',
+  'button[id*="showMore" i]',
+];
+
+const CHAT_EDITOR_SELECTORS = [
+  'div[data-tid="ckeditor"]',
+  '[data-tid="ckeditor"]',
+  '[aria-label="Type a message"]',
+  '[aria-label*="Type a message" i]',
+  '[data-tid="ckeditor"] [contenteditable="true"]',
+  '[contenteditable="true"][aria-label*="message" i]',
+];
+
+const CHAT_SEND_SELECTORS = [
+  'button[data-tid="send-message-button"]',
+  'button[data-tid="newMessageCommands-send"]',
+  'button[aria-label="Send"]',
+  'button[aria-label*="Send" i]',
+  'button[title="Send"]',
+  '[data-tid="sendMessage"]',
+  '[data-tid="chat-pane-compose-message-footer"] button[type="submit"]',
+  '[data-tid="chat-pane-compose-message-footer"] button[aria-label*="Send" i]',
+];
+
+/**
+ * Opens the Meeting chat panel and posts a short notice. Best-effort — failures must never
+ * abort an otherwise successful join (chat UI varies across Teams light vs classic).
+ *
+ * Retries for a while: the toolbar (and #chat-button) often appears several seconds after
+ * we consider ourselves "in meeting".
+ */
+export async function postRecordingNoticeInChat(page: Page, message = RECORDING_NOTICE): Promise<boolean> {
+  // Keep this short — we deliberately run before roster/mute tracking starts, and Teams only
+  // shows one side panel at a time.
+  const maxAttempts = 8;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (page.isClosed()) return false;
+
+      const opened = await ensureChatPanelOpen(page);
+      if (!opened) {
+        if (attempt === 1 || attempt % 2 === 0) {
+          console.log(`[teamsJoin] Chat button not ready (attempt ${attempt}/${maxAttempts})…`);
+        }
+        await sleep(700);
+        continue;
+      }
+
+      await sleep(500);
+      const typed = await typeAndSendChatMessage(page, message);
+      if (typed) {
+        console.log(`[teamsJoin] Posted chat notice: "${message}"`);
+        // Brief pause so Teams commits the send before anything else opens People.
+        await sleep(800);
+        return true;
+      }
+
+      console.log(`[teamsJoin] Chat compose box not ready (attempt ${attempt}/${maxAttempts})…`);
+      await sleep(700);
+    } catch (err) {
+      console.warn(`[teamsJoin] Chat notice attempt ${attempt} failed:`, err);
+      await sleep(700);
+    }
+  }
+
+  console.warn('[teamsJoin] Could not post recording notice in chat after retries.');
+  return false;
+}
+
+async function ensureChatPanelOpen(page: Page): Promise<boolean> {
+  // Only treat compose as open if it's a real on-screen Type-a-message box (not a hidden node).
+  if (await findChatEditorLocator(page)) {
+    console.log('[teamsJoin] Chat compose already open');
+    return true;
+  }
+
+  // 1) Toolbar Chat next to People
+  for (const frame of page.frames()) {
+    for (const selector of CHAT_BUTTON_SELECTORS) {
+      try {
+        const btn = frame.locator(selector).first();
+        if ((await btn.count()) === 0) continue;
+        const usable = await btn.evaluate((el) => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          return r.width > 8 && r.height > 8;
+        });
+        if (!usable) continue;
+        await btn.evaluate((el) => (el as HTMLElement).click());
+        console.log(`[teamsJoin] Clicked toolbar Chat via ${selector}`);
+        await sleep(1200);
+        if (await findChatEditorLocator(page)) return true;
+      } catch {
+        // try next
+      }
+    }
+  }
+
+  // 2) Fallback: open … More, then Chat (only if toolbar Chat isn't present)
+  console.log('[teamsJoin] Toolbar Chat not found — trying More (⋯) menu…');
+  for (const frame of page.frames()) {
+    for (const selector of MORE_BUTTON_SELECTORS) {
+      try {
+        const more = frame.locator(selector).first();
+        if ((await more.count()) === 0) continue;
+        await more.evaluate((el) => (el as HTMLElement).click());
+        console.log(`[teamsJoin] Opened More menu via ${selector}`);
+        await sleep(600);
+        const chatItem = frame
+          .locator(
+            '[role="menuitem"]:has-text("Chat"), [role="menuitem"][aria-label="Chat"], button:has-text("Chat"), [aria-label="Chat"]',
+          )
+          .first();
+        if ((await chatItem.count()) > 0) {
+          await chatItem.evaluate((el) => (el as HTMLElement).click());
+          console.log('[teamsJoin] Clicked Chat inside More menu');
+          await sleep(1200);
+          if (await findChatEditorLocator(page)) return true;
+        }
+      } catch {
+        // try next
+      }
+    }
+  }
+
+  return false;
+}
+
+async function findChatEditorLocator(page: Page) {
+  for (const frame of page.frames()) {
+    for (const selector of CHAT_EDITOR_SELECTORS) {
+      try {
+        const editor = frame.locator(selector).first();
+        if ((await editor.count()) === 0) continue;
+        // Prefer an actually editable node when nested.
+        const candidate = (await editor.locator('[contenteditable="true"]').count()) > 0
+          ? editor.locator('[contenteditable="true"]').first()
+          : editor;
+        // Reject hidden / zero-size nodes (false positives when chat isn't open).
+        const usable = await candidate.evaluate((el) => {
+          const node = el as HTMLElement;
+          const style = window.getComputedStyle(node);
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+          const r = node.getBoundingClientRect();
+          if (r.width < 40 || r.height < 16) return false;
+          const label = (node.getAttribute('aria-label') || '').toLowerCase();
+          const tid = (node.getAttribute('data-tid') || '').toLowerCase();
+          // Must look like meeting chat compose, not some other contenteditable.
+          return (
+            tid.includes('ckeditor') ||
+            label.includes('type a message') ||
+            !!node.closest('[data-tid*="chat"], [data-tid*="compose"], #chat-pane-list, [aria-label*="Meeting chat"]')
+          );
+        });
+        if (!usable) continue;
+        return candidate;
+      } catch {
+        // frame gone
+      }
+    }
+  }
+  return null;
+}
+
+async function typeAndSendChatMessage(page: Page, message: string): Promise<boolean> {
+  const editor = await findChatEditorLocator(page);
+  if (!editor) return false;
+
+  try {
+    // Focus via DOM (works off-screen). Prefer CDP Input.insertText — it types into the
+    // focused element without bringing Chromium to the foreground (unlike page.keyboard).
+    await editor.evaluate((el) => {
+      const node = el as HTMLElement;
+      node.focus();
+    });
+    await sleep(150);
+
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      // Select-all + delete any leftover draft.
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        modifiers: 2, // Ctrl
+        windowsVirtualKeyCode: 65,
+        code: 'KeyA',
+        key: 'a',
+      });
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        modifiers: 2,
+        windowsVirtualKeyCode: 65,
+        code: 'KeyA',
+        key: 'a',
+      });
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        windowsVirtualKeyCode: 8,
+        code: 'Backspace',
+        key: 'Backspace',
+      });
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        windowsVirtualKeyCode: 8,
+        code: 'Backspace',
+        key: 'Backspace',
+      });
+      await cdp.send('Input.insertText', { text: message });
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
+    await sleep(400);
+
+    let draft = ((await editor.innerText().catch(() => '')) || '').trim();
+    if (!draft.includes(message.slice(0, 12))) {
+      // Last resort: keyboard (may briefly focus Chromium).
+      console.warn(`[teamsJoin] CDP insertText missed (saw: "${draft.slice(0, 40)}"), trying keyboard…`);
+      await editor.evaluate((el) => (el as HTMLElement).focus());
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Backspace');
+      await page.keyboard.type(message, { delay: 20 });
+      await sleep(400);
+      draft = ((await editor.innerText().catch(() => '')) || '').trim();
+    }
+
+    if (!draft.includes(message.slice(0, 12))) {
+      console.warn(`[teamsJoin] Compose box did not accept text (saw: "${draft.slice(0, 40)}")`);
+      return false;
+    }
+    console.log('[teamsJoin] Typed recording notice into compose box');
+
+    let sent = false;
+    for (const frame of page.frames()) {
+      for (const selector of CHAT_SEND_SELECTORS) {
+        try {
+          const send = frame.locator(selector).first();
+          if ((await send.count()) === 0) continue;
+          await send.evaluate((el) => (el as HTMLElement).click());
+          sent = true;
+          console.log(`[teamsJoin] Sent chat via ${selector}`);
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (sent) break;
+    }
+
+    if (!sent) {
+      const cdpEnter = await page.context().newCDPSession(page);
+      try {
+        await cdpEnter.send('Input.dispatchKeyEvent', {
+          type: 'keyDown',
+          windowsVirtualKeyCode: 13,
+          code: 'Enter',
+          key: 'Enter',
+        });
+        await cdpEnter.send('Input.dispatchKeyEvent', {
+          type: 'keyUp',
+          windowsVirtualKeyCode: 13,
+          code: 'Enter',
+          key: 'Enter',
+        });
+        console.log('[teamsJoin] Sent chat via Enter (CDP)');
+      } finally {
+        await cdpEnter.detach().catch(() => undefined);
+      }
+    }
+
+    await sleep(900);
+
+    const after = ((await editor.innerText().catch(() => '')) || '').trim();
+    if (!after.includes(message.slice(0, 12))) {
+      console.log('[teamsJoin] Compose cleared after send — treating as success');
+      return true;
+    }
+
+    for (const frame of page.frames()) {
+      try {
+        const hit = await frame.evaluate((msg) => (document.body?.innerText || '').includes(msg), message);
+        if (hit) {
+          console.log('[teamsJoin] Found notice text in chat pane');
+          return true;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    console.warn('[teamsJoin] Send attempted but message still in compose / not found in pane');
+    return false;
+  } catch (err) {
+    console.warn('[teamsJoin] typeAndSendChatMessage failed:', err);
+    return false;
+  }
 }
 
 /**

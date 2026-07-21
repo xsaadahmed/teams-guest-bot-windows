@@ -4,6 +4,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { TeamsGuestBot } from './bot';
 import { applyUiWindowLayout } from './uiWindow';
+import { bootstrapUserConfig, getLocalParticipantName, saveUserConfig } from './userConfig';
+
+bootstrapUserConfig();
+{
+  const name = getLocalParticipantName();
+  if (name) {
+    console.log(`Local participant [mute-gated mic]: ${name}`);
+  } else {
+    console.log('Local participant name: not set — Web UI will ask on first open');
+  }
+}
 
 /** Opens the Web UI in a dedicated app window (not a browser tab). Set OPEN_WEB_UI=0 to skip. */
 function openWebUiWindow(port: number): void {
@@ -11,11 +22,13 @@ function openWebUiWindow(port: number): void {
 
   const url = `http://localhost:${port}/`;
 
-  // Prefer Edge/Chrome app mode (dedicated window, no tab strip). `start` resolves App Paths on Windows.
+  // Prefer launching the browser binary directly — `cmd /c start` can flash a console window.
   const attempts: Array<{ label: string; command: string; args: string[] }> = [
-    { label: 'msedge', command: 'cmd', args: ['/c', 'start', '', 'msedge', `--app=${url}`] },
-    { label: 'chrome', command: 'cmd', args: ['/c', 'start', '', 'chrome', `--app=${url}`] },
-    { label: 'default', command: 'cmd', args: ['/c', 'start', '', url] },
+    { label: 'msedge', command: 'msedge', args: [`--app=${url}`] },
+    { label: 'chrome', command: 'chrome', args: [`--app=${url}`] },
+    // Fallbacks when Edge/Chrome aren't on PATH (App Paths via start).
+    { label: 'msedge-start', command: 'cmd', args: ['/c', 'start', '', '/b', 'msedge', `--app=${url}`] },
+    { label: 'chrome-start', command: 'cmd', args: ['/c', 'start', '', '/b', 'chrome', `--app=${url}`] },
   ];
 
   const tryNext = (i: number) => {
@@ -60,18 +73,44 @@ app.get('/status', (_req: Request, res: Response) => {
   res.json(bot.getStatus());
 });
 
+/** Local user settings (Teams display name for mute gating). */
+app.get('/config', (_req: Request, res: Response) => {
+  res.json({
+    localParticipantName: getLocalParticipantName(),
+    botDisplayName: process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant',
+  });
+});
+
+app.put('/config', (req: Request, res: Response) => {
+  const name = req.body?.localParticipantName;
+  if (typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'localParticipantName is required.' });
+  }
+  const cfg = saveUserConfig({ localParticipantName: name });
+  console.log(`[config] Local participant name set to "${cfg.localParticipantName}"`);
+  res.json({
+    localParticipantName: cfg.localParticipantName,
+    botDisplayName: process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant',
+  });
+});
+
 /**
- * Tells the bot to join a Teams meeting as a guest. Body: { "meetingUrl": "...", "displayName": "..." }
+ * Tells the bot to join a Teams meeting as a guest.
+ * Body: { "meetingUrl": "...", "displayName": "...", "announceRecordingInChat": true|false }
  * Recording starts automatically once it's actually let into the meeting.
  */
 app.post('/join', async (req: Request, res: Response) => {
-  const { meetingUrl, displayName } = req.body ?? {};
+  const { meetingUrl, displayName, announceRecordingInChat } = req.body ?? {};
   if (!meetingUrl || typeof meetingUrl !== 'string') {
     return res.status(400).json({ error: 'Request body must include "meetingUrl".' });
   }
 
   try {
-    const status = await bot.join({ meetingUrl, displayName });
+    const status = await bot.join({
+      meetingUrl,
+      displayName,
+      announceRecordingInChat: announceRecordingInChat !== false,
+    });
     res.status(202).json(status);
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });

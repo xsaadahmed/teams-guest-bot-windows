@@ -16,7 +16,7 @@ import { IAudioRecorder } from './audioRecorderTypes';
 export class WindowsAudioRecorder implements IAudioRecorder {
   private helper: ChildProcessWithoutNullStreams | null = null;
   private readonly helperPath: string;
-  private readonly micGated: boolean;
+  private micGated = false;
   private level = 0;
 
   constructor(helperPath?: string) {
@@ -24,7 +24,6 @@ export class WindowsAudioRecorder implements IAudioRecorder {
       helperPath ||
       process.env.WASAPI_HELPER_PATH ||
       path.join(__dirname, '..', 'windows', 'WasapiLoopbackRecorder', 'publish', 'WasapiLoopbackRecorder.exe');
-    this.micGated = Boolean(process.env.LOCAL_PARTICIPANT_NAME?.trim()) && process.env.WASAPI_NO_MIC !== 'true';
   }
 
   public get audioLevel(): number {
@@ -35,6 +34,10 @@ export class WindowsAudioRecorder implements IAudioRecorder {
     if (this.helper) {
       throw new Error('AudioRecorder is already recording.');
     }
+
+    // Resolve at start time so a first-run UI name save applies without restarting the server.
+    this.micGated =
+      Boolean(process.env.LOCAL_PARTICIPANT_NAME?.trim()) && process.env.WASAPI_NO_MIC !== 'true';
 
     if (!fs.existsSync(this.helperPath)) {
       throw new Error(

@@ -67,6 +67,16 @@ export function toDirectJoinUrl(originalLink: string): string {
     }
 
     if (url.hostname.includes('teams.microsoft.com')) {
+      const meetupPath = url.pathname.match(/^\/l\/meetup-join\/(.+)\/(\d+)$/);
+      if (meetupPath) {
+        const [, threadId, timestamp] = meetupPath;
+        const context = url.searchParams.get('context');
+        if (context) {
+          return `https://teams.microsoft.com/v2/?meetingjoin=true&suppressPrompt=true#/l/meetup-join/${threadId}/${timestamp}?context=${encodeURIComponent(context)}&anon=true&suppressPrompt=true`;
+        }
+      }
+
+      // Legacy calendar-invite links that still use the bare teams.microsoft.com host.
       const match = originalLink.match(
         /https:\/\/teams\.microsoft\.com\/l\/meetup-join\/(.*?)\/(\d+)\?context=(.*?)(?:$|&)/,
       );

@@ -6,6 +6,7 @@ Recordings/
 .teams-bot-browser-profile/
 *.log
 .env
+.teams-bot-config.json
 test_stdin.txt
 windows/WasapiLoopbackRecorder/test.wav
 windows/test-*.js
