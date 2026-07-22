@@ -396,7 +396,7 @@ function Index() {
     </RecorderContext.Provider>
   );
 
-  if (overlayOnly) {
+  if (overlayOnly && !inPageOverlay) {
     return shell(
       <div
         className={cn(
@@ -476,18 +476,37 @@ function Index() {
           {page === "summaries" && <SummariesPage setPage={setPage} />}
           {page === "info" && <AboutPage />}
         </SidebarInset>
-        <DockedMeetingAssistant chromeCollapsed={page === "recording"} />
+        <DockedMeetingAssistant
+          chromeCollapsed={page === "recording"}
+          forceVisible={inPageOverlay && recorder.mode === "recording"}
+          preferInPage={inPageOverlay}
+        />
       </SidebarProvider>
     </>,
   );
 }
 
 /** Floats the mini recorder just to the right of the sidebar so it never covers Dark mode / About. */
-function DockedMeetingAssistant({ chromeCollapsed }: { chromeCollapsed: boolean }) {
+function DockedMeetingAssistant({
+  chromeCollapsed,
+  forceVisible = false,
+  preferInPage = false,
+}: {
+  chromeCollapsed: boolean;
+  forceVisible?: boolean;
+  preferInPage?: boolean;
+}) {
   const { state } = useSidebar();
   // Explicit rem values (match SIDEBAR_WIDTH / SIDEBAR_WIDTH_ICON) — more reliable than CSS vars on fixed elements.
   const leftClass = state === "expanded" ? "left-[12.75rem]" : "left-[3.75rem]";
-  return <MeetingAssistantWindow chromeCollapsed={chromeCollapsed} dockClassName={leftClass} />;
+  return (
+    <MeetingAssistantWindow
+      chromeCollapsed={chromeCollapsed}
+      dockClassName={leftClass}
+      forceVisible={forceVisible}
+      preferInPage={preferInPage}
+    />
+  );
 }
 
 /* ---------------- Sidebar ---------------- */
