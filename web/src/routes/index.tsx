@@ -130,26 +130,76 @@ function normalizeMainGeometry(g: WindowGeometry | null): WindowGeometry {
   return g;
 }
 
-function placeOverlayWindow(collapsed: boolean) {
+/**
+ * null = not probed yet, true = Edge/OS accepts resize or Win32 layout,
+ * false = corp/locked browser — use in-page floating card only (no PowerShell spam).
+ */
+let osWindowLayoutCapable: boolean | null = null;
+
+function overlayTargetRect(collapsed: boolean) {
   const size = collapsed ? OVERLAY_COLLAPSED : OVERLAY_EXPANDED;
-  // avail* excludes the taskbar — keep the mini UI on the visible bottom-left.
   const availLeft = window.screen.availLeft ?? 0;
   const availTop = window.screen.availTop ?? 0;
   const availH = window.screen.availHeight;
   const left = availLeft + OVERLAY_MARGIN.left;
   const top = availTop + Math.max(0, availH - size.height - OVERLAY_MARGIN.bottom);
+  return { ...size, left, top };
+}
+
+function windowMatchesSize(size: { width: number; height: number }, slack = 56): boolean {
+  return (
+    Math.abs(window.outerWidth - size.width) <= slack &&
+    Math.abs(window.outerHeight - size.height) <= slack + 24
+  );
+}
+
+function tryBrowserWindowLayout(size: { width: number; height: number }, left: number, top: number): boolean {
   try {
     window.resizeTo(size.width, size.height);
     window.moveTo(left, top);
   } catch {
-    // Edge --app often ignores resizeTo/moveTo; Win32 path below is the real resize.
+    return false;
   }
-  void positionUiWindow({
-    ...size,
-    left,
-    top,
-    topmost: true,
-  }).catch(() => undefined);
+  return windowMatchesSize(size);
+}
+
+/**
+ * Prefer shrinking the Edge --app window (home). If that fails (common on corporate
+ * Edge where resizeTo is a silent no-op and PowerShell is EPERM), fall back to the
+ * in-page fixed bottom-left mini card — same as the DevTools floating-div test.
+ */
+function placeOverlayWindow(collapsed: boolean): "os" | "inpage" {
+  const { width, height, left, top } = overlayTargetRect(collapsed);
+  const size = { width, height };
+
+  if (osWindowLayoutCapable === false) {
+    return "inpage";
+  }
+
+  if (tryBrowserWindowLayout(size, left, top)) {
+    osWindowLayoutCapable = true;
+    void positionUiWindow({ ...size, left, top, topmost: true }).catch(() => undefined);
+    return "os";
+  }
+
+  // One Win32 attempt on machines where resizeTo fails but PowerShell works.
+  if (osWindowLayoutCapable === null) {
+    void positionUiWindow({ ...size, left, top, topmost: true })
+      .then(() => {
+        window.setTimeout(() => {
+          if (windowMatchesSize(size)) {
+            osWindowLayoutCapable = true;
+          } else {
+            osWindowLayoutCapable = false;
+          }
+        }, 200);
+      })
+      .catch(() => {
+        osWindowLayoutCapable = false;
+      });
+  }
+
+  return "inpage";
 }
 
 function restoreMainWindow(g: WindowGeometry | null) {
@@ -160,14 +210,17 @@ function restoreMainWindow(g: WindowGeometry | null) {
   } catch {
     // ignore
   }
-  // Clear always-on-top and restore absolute screen position (not bottom-anchored).
+  // Skip PowerShell when we already know corp policy blocks it.
+  if (osWindowLayoutCapable === false) return;
   void positionUiWindow({
     width: geometry.width,
     height: geometry.height,
     left: geometry.x,
     top: geometry.y,
     topmost: false,
-  }).catch(() => undefined);
+  }).catch(() => {
+    osWindowLayoutCapable = false;
+  });
 }
 
 function exitOverlayMode(
@@ -190,6 +243,8 @@ function Index() {
   const [collapsed, setCollapsed] = useState(true);
   const [page, setPage] = useState<Page>("home");
   const [overlayOnly, setOverlayOnly] = useState(false);
+  /** When OS can't shrink Edge (corp), keep the mini recorder as an in-page floating card. */
+  const [inPageOverlay, setInPageOverlay] = useState(false);
   const [theme, setTheme] = useState<Theme>(() =>
     typeof document !== "undefined" ? resolveTheme() : "light",
   );
@@ -235,8 +290,9 @@ function Index() {
     }
   };
 
-  // On first load of the full UI, ensure we are not stuck HWND_TOPMOST (blocks Alt+Tab feel).
+  // On first load of the full UI, clear always-on-top when Win32 layout is available.
   useEffect(() => {
+    if (osWindowLayoutCapable === false) return;
     const g = captureWindowGeometry();
     void positionUiWindow({
       width: g.width,
@@ -244,7 +300,9 @@ function Index() {
       left: g.x,
       top: g.y,
       topmost: false,
-    }).catch(() => undefined);
+    }).catch(() => {
+      osWindowLayoutCapable = false;
+    });
   }, []);
 
   useEffect(() => {
@@ -262,15 +320,48 @@ function Index() {
     return () => window.clearTimeout(t);
   }, [recorder.mode]);
 
-  // Retry OS resize while in overlay — Edge often ignores the first few attempts.
+  // Probe OS resize once; if blocked, lock into in-page floating card (Option A).
   useEffect(() => {
     if (!overlayOnly) return;
-    placeOverlayWindow(miniCollapsedRef.current);
-    const delays = [50, 150, 350, 700, 1200, 2000, 3500];
+
+    const apply = () => {
+      const mode = placeOverlayWindow(miniCollapsedRef.current);
+      if (mode === "inpage" || osWindowLayoutCapable === false) {
+        setInPageOverlay(true);
+      } else {
+        setInPageOverlay(false);
+      }
+    };
+
+    apply();
+    // Few short retries only while capability is still unknown (home Edge often needs a beat).
+    const delays =
+      osWindowLayoutCapable === false ? [] : [80, 200, 500, 1000];
     const timers = delays.map((ms) =>
-      window.setTimeout(() => placeOverlayWindow(miniCollapsedRef.current), ms),
+      window.setTimeout(() => {
+        if (osWindowLayoutCapable === false) {
+          setInPageOverlay(true);
+          return;
+        }
+        apply();
+      }, ms),
     );
-    return () => timers.forEach((id) => window.clearTimeout(id));
+    // After probes, decide: OS-shrunk window vs in-page floating card.
+    const finalize = window.setTimeout(() => {
+      const size = miniCollapsedRef.current ? OVERLAY_COLLAPSED : OVERLAY_EXPANDED;
+      if (windowMatchesSize(size)) {
+        osWindowLayoutCapable = true;
+        setInPageOverlay(false);
+      } else {
+        osWindowLayoutCapable = false;
+        setInPageOverlay(true);
+      }
+    }, 1400);
+
+    return () => {
+      timers.forEach((id) => window.clearTimeout(id));
+      window.clearTimeout(finalize);
+    };
   }, [overlayOnly]);
 
   useEffect(() => {
@@ -279,7 +370,10 @@ function Index() {
 
     const g = savedGeometry.current;
     savedGeometry.current = null;
-    return exitOverlayMode(g, () => setOverlayOnly(false));
+    return exitOverlayMode(g, () => {
+      setOverlayOnly(false);
+      setInPageOverlay(false);
+    });
   }, [recorder.mode, overlayOnly]);
 
   const joinAndPrepareOverlay = async () => {
@@ -304,13 +398,21 @@ function Index() {
 
   if (overlayOnly) {
     return shell(
-      <div className="h-full w-full overflow-hidden bg-background">
+      <div
+        className={cn(
+          "h-full w-full overflow-hidden",
+          // In-page fallback: leave a quiet canvas so the fixed mini card reads as floating.
+          inPageOverlay ? "bg-transparent" : "bg-background",
+        )}
+      >
         <MeetingAssistantWindow
           forceVisible
           highest
+          preferInPage={inPageOverlay}
           onChromeCollapseChange={(miniCollapsed) => {
             miniCollapsedRef.current = miniCollapsed;
-            placeOverlayWindow(miniCollapsed);
+            const mode = placeOverlayWindow(miniCollapsed);
+            if (mode === "inpage") setInPageOverlay(true);
           }}
         />
       </div>,
@@ -1888,12 +1990,18 @@ function RecorderPanel({ size = "mini", overlay = false }: { size?: "mini" | "la
 function MeetingAssistantWindow({
   forceVisible = false,
   highest = false,
+  preferInPage = false,
   chromeCollapsed,
   dockClassName,
   onChromeCollapseChange,
 }: {
   forceVisible?: boolean;
   highest?: boolean;
+  /**
+   * When true, always use the in-page fixed mini card (corporate Edge can't resize
+   * the outer window). Ignores osSized / fill-window mode.
+   */
+  preferInPage?: boolean;
   /** When true, show only the title bar (used on Record page so the large panel is the focus). */
   chromeCollapsed?: boolean;
   /** Overrides default bottom-left docking (e.g. clear of the sidebar). */
@@ -1936,7 +2044,7 @@ function MeetingAssistantWindow({
   }, [chromeCollapsed, forceVisible, highest]);
 
   useEffect(() => {
-    if (!highest) {
+    if (!highest || preferInPage) {
       setOsSized(false);
       return;
     }
@@ -1952,7 +2060,7 @@ function MeetingAssistantWindow({
       window.clearInterval(id);
       window.removeEventListener("resize", check);
     };
-  }, [highest]);
+  }, [highest, preferInPage]);
 
   const collapseCb = useRef(onChromeCollapseChange);
   collapseCb.current = onChromeCollapseChange;
@@ -1973,7 +2081,8 @@ function MeetingAssistantWindow({
 
   if (closed && !forceVisible) return null;
 
-  const fillWindow = highest && osSized;
+  // Corp / locked Edge: preferInPage forces the floating card (DevTools Option A).
+  const fillWindow = highest && osSized && !preferInPage;
 
   return (
     <Card

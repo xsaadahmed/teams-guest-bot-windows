@@ -13,6 +13,20 @@ export type UiWindowLayout = {
   topmost?: boolean;
 };
 
+/** Once PowerShell spawn is blocked (corporate EPERM), stop retrying. */
+let spawnBlocked = false;
+
+function markSpawnBlocked(err: Error): void {
+  const msg = err.message || String(err);
+  if (/EPERM|spawn/i.test(msg)) {
+    spawnBlocked = true;
+  }
+  console.warn('[uiWindow] Could not position UI window:', msg);
+  if (spawnBlocked) {
+    console.warn('[uiWindow] Disabling further window-layout attempts (use in-page mini overlay).');
+  }
+}
+
 /**
  * Positions the Edge/Chrome "Meeting Assistant" app window.
  * Uses SWP_NOACTIVATE so it does not steal keyboard focus.
@@ -20,6 +34,8 @@ export type UiWindowLayout = {
  */
 export function applyUiWindowLayout(layout: UiWindowLayout): void {
   if (process.platform !== 'win32') return;
+  // After a spawn EPERM, skip further attempts (corporate policy) — UI uses in-page overlay.
+  if (spawnBlocked) return;
 
   const left = Number.isFinite(layout.left) ? Math.round(layout.left as number) : 8;
   const topmost = layout.topmost === true ? 1 : 0;
@@ -145,7 +161,7 @@ Write-Output ("moved:1 hwnd=" + $target + " topmost=" + $topmost + " " + $w + "x
       { windowsHide: true, timeout: 8000 },
       (err, stdout) => {
         if (err) {
-          console.warn('[uiWindow] Could not position UI window:', err.message);
+          markSpawnBlocked(err);
           return;
         }
         const out = String(stdout || '').trim();
@@ -153,6 +169,6 @@ Write-Output ("moved:1 hwnd=" + $target + " topmost=" + $topmost + " " + $w + "x
       },
     );
   } catch (err) {
-    console.warn('[uiWindow] Could not spawn PowerShell for window layout:', (err as Error).message);
+    markSpawnBlocked(err as Error);
   }
 }

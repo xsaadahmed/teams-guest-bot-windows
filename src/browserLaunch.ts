@@ -560,12 +560,31 @@ if ($rect.Left -gt -10000) { return }
   [RestoreChrome]::SWP_NOACTIVATE -bor [RestoreChrome]::SWP_SHOWWINDOW -bor [RestoreChrome]::SWP_FRAMECHANGED
 ) | Out-Null
 `;
-    execFile(
-      'powershell',
-      ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { windowsHide: true, timeout: 3000 },
-      () => undefined,
-    );
+    try {
+      execFile(
+        'powershell',
+        ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        { windowsHide: true, timeout: 3000 },
+        (err) => {
+          // Corporate laptops often block PowerShell (EPERM). Never let this kill the bot.
+          if (err && !stopped) {
+            stopped = true;
+            clearInterval(timer);
+            console.warn(
+              '[browserLaunch] Manual restore watcher disabled (PowerShell spawn blocked):',
+              err.message,
+            );
+          }
+        },
+      );
+    } catch (err) {
+      stopped = true;
+      clearInterval(timer);
+      console.warn(
+        '[browserLaunch] Manual restore watcher disabled (PowerShell spawn blocked):',
+        (err as Error).message,
+      );
+    }
   };
 
   const timer = setInterval(tryRestore, 1000);
