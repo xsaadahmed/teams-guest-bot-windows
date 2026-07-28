@@ -16,12 +16,17 @@ import {
   getParticipantCount,
   ensureRosterPanelOpen,
   postRecordingNoticeInChat,
+  dismissAvPermissionModalIfPresent,
+  startAvPermissionModalWatcher,
+  isRosterAutomationEnabled,
+  readMeetingTitle,
 } from './teamsJoin';
 import { AudioRecorder } from './audioRecorder';
 import { CaptionTracker, CaptionEntry } from './captionTracker';
 import { autoTranscribeInBackground } from './autoTranscribe';
 import { RosterMuteTracker } from './rosterMuteTracker';
 import { getLocalParticipantName } from './userConfig';
+import { renameRecordingArtifacts } from './recordingFileName';
 
 export type BotState = 'idle' | 'joining' | 'in_meeting' | 'leaving' | 'error';
 
@@ -47,10 +52,21 @@ export interface BotStatus {
    * UI uses this so the sound wave stays flat while you are muted.
    */
   localMicOpen?: boolean;
+  /**
+   * When set, the bot is alone in the meeting and will auto-leave after this many seconds
+   * (countdown for Mini UI).
+   */
+  aloneLeaveInSeconds?: number;
 }
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(process.cwd(), 'Recordings');
 const DEFAULT_DISPLAY_NAME = process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant';
+/** How long the bot waits alone before auto-leaving. */
+const ALONE_LEAVE_MS = 15_000;
+/** How often to re-check participant count while in a meeting. */
+const ALONE_POLL_MS = 5_000;
+/** How often to scrape the roster and merge into the "people seen" set. */
+const PARTICIPANT_POLL_MS = 90_000;
 
 /**
  * Owns a single guest "session" in a Teams meeting: one browser context, one page,
@@ -65,23 +81,38 @@ export class TeamsGuestBot {
   private recorder = new AudioRecorder();
   private captions = new CaptionTracker();
   private pollHandle: NodeJS.Timeout | null = null;
+  /** Separate from alone-detection — accumulates roster names every PARTICIPANT_POLL_MS. */
+  private participantPollHandle: NodeJS.Timeout | null = null;
   private status: BotStatus = { state: 'idle' };
   private recordingFilePath: string | null = null;
   private captionsActive = false;
   private stopProtocolDialogWatcher: (() => void) | null = null;
+  private stopAvModalWatcher: (() => void) | null = null;
   private stopManualBrowserRestoreWatcher: (() => void) | null = null;
   private muteTracker: RosterMuteTracker | null = null;
   private recordingPaused = false;
   /** Fail-open until mute tracker confirms a muted roster state. */
   private localMicOpen = true;
+  /** Wall-clock when the bot first appeared alone; null when not alone. */
+  private aloneSinceMs: number | null = null;
+  /** Names seen on the roster at any point during this meeting (union of scrapes). */
+  private seenParticipants = new Set<string>();
 
   public getStatus(): BotStatus {
+    let aloneLeaveInSeconds: number | undefined;
+    if (this.state === 'in_meeting' && this.aloneSinceMs != null) {
+      aloneLeaveInSeconds = Math.max(
+        0,
+        Math.ceil((this.aloneSinceMs + ALONE_LEAVE_MS - Date.now()) / 1000),
+      );
+    }
     return {
       ...this.status,
       state: this.state,
       paused: this.state === 'in_meeting' ? this.recordingPaused : undefined,
       audioLevel: this.state === 'in_meeting' ? this.recorder.audioLevel : undefined,
       localMicOpen: this.state === 'in_meeting' ? this.localMicOpen : undefined,
+      aloneLeaveInSeconds,
     };
   }
 
@@ -94,6 +125,9 @@ export class TeamsGuestBot {
     this.state = 'joining';
     this.recordingPaused = false;
     this.localMicOpen = true;
+    this.aloneSinceMs = null;
+    this.seenParticipants.clear();
+    this.stopParticipantAccumulator();
     this.status = { state: 'joining', meetingUrl: req.meetingUrl, displayName };
 
     // Silent join: Chromium stays off-screen (launch args + park). Do NOT bring it to the
@@ -136,6 +170,10 @@ export class TeamsGuestBot {
       this.stopProtocolDialogWatcher?.();
       this.stopProtocolDialogWatcher = startProtocolDialogWatcher(this.page);
 
+      this.stopAvModalWatcher?.();
+      this.stopAvModalWatcher = startAvPermissionModalWatcher(this.page);
+      await dismissAvPermissionModalIfPresent(this.page);
+
       await new Promise((r) => setTimeout(r, 3000));
 
       if (this.page) {
@@ -148,6 +186,11 @@ export class TeamsGuestBot {
       }
 
       this.state = 'in_meeting';
+      if (!isRosterAutomationEnabled()) {
+        console.log(
+          '[bot] DISABLE_ROSTER_AUTOMATION is on — bot will not open the People roster (manual UI debugging).',
+        );
+      }
       this.status = {
         state: 'in_meeting',
         meetingUrl: req.meetingUrl,
@@ -182,6 +225,8 @@ export class TeamsGuestBot {
       // Now safe to open the People panel for mute gating + alone detection.
       this.startEndOfMeetingWatcher();
       this.startMuteTracker();
+      // Seed + refresh roster names every 90s so early leavers are still listed.
+      this.startParticipantAccumulator();
       this.stopManualBrowserRestoreWatcher?.();
       this.stopManualBrowserRestoreWatcher = startManualBrowserRestoreWatcher(this.page);
 
@@ -222,11 +267,25 @@ export class TeamsGuestBot {
     this.state = 'leaving';
     this.status = { ...this.status, state: 'leaving' };
     this.recordingPaused = false;
+    this.aloneSinceMs = null;
     this.captions.setPaused(false);
     this.stopEndOfMeetingWatcher();
+    this.stopParticipantAccumulator();
     this.stopMuteTracker();
 
     try {
+      // Read meeting title while still in the call (opens Meeting info briefly, then closes it).
+      let meetingTitle: string | null = null;
+      if (this.page) {
+        meetingTitle = await readMeetingTitle(this.page).catch((err) => {
+          console.warn('[bot] Could not read meeting title before leave:', err);
+          return null;
+        });
+        if (this.context) {
+          await minimizeWindowBestEffort(this.context, this.page);
+        }
+      }
+
       // Finalize the captions transcript while the page is still alive (the speaker names live in
       // the page DOM - once we close the browser they're gone).
       await this.finalizeTranscript().catch((err) =>
@@ -241,6 +300,20 @@ export class TeamsGuestBot {
 
       await this.recorder.stop();
 
+      if (this.recordingFilePath && meetingTitle) {
+        try {
+          const renamed = renameRecordingArtifacts(this.recordingFilePath, meetingTitle, RECORDINGS_DIR);
+          if (renamed !== this.recordingFilePath) {
+            console.log(`[bot] Renamed recording to "${path.basename(renamed)}"`);
+          }
+          this.recordingFilePath = renamed;
+        } catch (err) {
+          console.warn('[bot] Could not rename recording to meeting title:', err);
+        }
+      } else if (this.recordingFilePath && !meetingTitle) {
+        console.warn('[bot] No meeting title — keeping timestamp file name.');
+      }
+
       // Only safe to hand off once recorder.stop() above has resolved - that's the point at
       // which the WAV is guaranteed complete and finalized. (This is also why it's not inside
       // finalizeTranscript(): that runs earlier, while the page is still open to read captions
@@ -252,6 +325,8 @@ export class TeamsGuestBot {
       await this.cleanupBrowser();
     } finally {
       // Always clear leaving — otherwise auto-leave can leave the UI stuck on "Recording".
+      this.stopParticipantAccumulator();
+      this.seenParticipants.clear();
       this.recordingFilePath = null;
       this.state = 'idle';
       this.status = { state: 'idle' };
@@ -268,7 +343,18 @@ export class TeamsGuestBot {
     if (!this.captionsActive || !this.recordingFilePath) return;
 
     const entries = await this.captions.stop();
-    const participants = this.page ? await this.captions.getParticipants(this.page) : [];
+    // Final scrape + merge so anyone still present is included with everyone seen earlier.
+    if (this.page) {
+      try {
+        const latest = await this.captions.getParticipants(this.page);
+        this.mergeSeenParticipants(latest);
+      } catch (err) {
+        console.warn('[bot] final participant scrape failed:', (err as Error).message);
+      }
+    }
+    const participants = Array.from(this.seenParticipants).sort((a, b) =>
+      a.localeCompare(b, undefined, { sensitivity: 'base' }),
+    );
     this.captionsActive = false;
 
     const base = this.recordingFilePath.replace(/\.wav$/i, '');
@@ -282,7 +368,7 @@ export class TeamsGuestBot {
     fs.writeFileSync(txtPath, this.formatTranscript(entries, participants));
 
     console.log(
-      `[bot] Wrote transcript: ${entries.length} caption line(s) from ${participants.length} known participant(s) -> ${path.basename(txtPath)}`,
+      `[bot] Wrote transcript: ${entries.length} caption line(s) from ${participants.length} participant(s) seen -> ${path.basename(txtPath)}`,
     );
     if (entries.length === 0) {
       console.warn(
@@ -305,7 +391,7 @@ export class TeamsGuestBot {
       entries.length > 0
         ? entries.map((e) => `[${fmt(e.tStartMs)}] ${e.speaker}: ${e.text}`).join('\n')
         : 'No captions were captured.';
-    out += '\n\n--- Participants ---\n\n';
+    out += '\n\n--- Participants (seen during meeting) ---\n\n';
     out += participants.length > 0 ? participants.join('\n') : 'Not captured.';
     out += '\n';
     return out;
@@ -314,6 +400,8 @@ export class TeamsGuestBot {
   private async cleanupBrowser(): Promise<void> {
     this.stopProtocolDialogWatcher?.();
     this.stopProtocolDialogWatcher = null;
+    this.stopAvModalWatcher?.();
+    this.stopAvModalWatcher = null;
     this.stopManualBrowserRestoreWatcher?.();
     this.stopManualBrowserRestoreWatcher = null;
     try {
@@ -327,7 +415,7 @@ export class TeamsGuestBot {
 
   /** Auto-stops the recording if the meeting ends without anyone calling /leave. */
   private startEndOfMeetingWatcher(): void {
-    let aloneStreak = 0; // consecutive 10s ticks where bot appears to be alone
+    this.aloneSinceMs = null;
 
     this.pollHandle = setInterval(async () => {
       if (!this.page || this.state !== 'in_meeting') return;
@@ -348,19 +436,24 @@ export class TeamsGuestBot {
         console.log(`[bot] Participant count: ${count}`);
       }
       if (count !== null && count <= 1) {
-        aloneStreak++;
-        console.log(`[bot] Bot appears to be alone in meeting (${aloneStreak * 10}s elapsed)`);
-        // Wait 30 seconds before leaving — gives time for a participant who briefly
-        // dropped connection to rejoin before the bot abandons the meeting.
-        if (aloneStreak >= 3) {
-          console.log('[bot] Bot has been alone for 30s - leaving meeting');
+        if (this.aloneSinceMs == null) {
+          this.aloneSinceMs = Date.now();
+          console.log('[bot] Bot appears to be alone — starting 15s leave countdown');
+        }
+        const elapsed = Date.now() - this.aloneSinceMs;
+        console.log(`[bot] Bot alone in meeting (${Math.round(elapsed / 1000)}s / 15s)`);
+        if (elapsed >= ALONE_LEAVE_MS) {
+          console.log('[bot] Bot has been alone for 15s - leaving meeting');
           this.stopEndOfMeetingWatcher();
           await this.leave().catch((err) => console.error('[bot] error during alone-leave:', err));
         }
       } else {
-        aloneStreak = 0; // someone rejoined, reset the counter
+        if (this.aloneSinceMs != null) {
+          console.log('[bot] Someone rejoined — cancelling alone-leave countdown');
+        }
+        this.aloneSinceMs = null;
       }
-    }, 10_000);
+    }, ALONE_POLL_MS);
   }
 
   private stopEndOfMeetingWatcher(): void {
@@ -368,10 +461,60 @@ export class TeamsGuestBot {
       clearInterval(this.pollHandle);
       this.pollHandle = null;
     }
+    this.aloneSinceMs = null;
+  }
+
+  /** Merge roster names into the meeting-lifetime "people seen" set. */
+  private mergeSeenParticipants(names: string[]): void {
+    let added = 0;
+    for (const raw of names) {
+      const name = raw.trim();
+      if (!name || this.seenParticipants.has(name)) continue;
+      this.seenParticipants.add(name);
+      added++;
+    }
+    if (added > 0) {
+      console.log(
+        `[bot] Participants seen: ${this.seenParticipants.size} total (+${added} new)`,
+      );
+    }
+  }
+
+  private async refreshSeenParticipants(): Promise<void> {
+    if (!this.page || this.state !== 'in_meeting') return;
+    try {
+      const names = await this.captions.getParticipants(this.page);
+      this.mergeSeenParticipants(names);
+    } catch (err) {
+      console.warn('[bot] participant scrape failed:', (err as Error).message);
+    }
+  }
+
+  /**
+   * Scrape roster immediately after People is available, then every 90s, unioning names
+   * so early leavers remain in the transcript participant list.
+   */
+  private startParticipantAccumulator(): void {
+    this.stopParticipantAccumulator();
+    void this.refreshSeenParticipants();
+    this.participantPollHandle = setInterval(() => {
+      void this.refreshSeenParticipants();
+    }, PARTICIPANT_POLL_MS);
+  }
+
+  private stopParticipantAccumulator(): void {
+    if (this.participantPollHandle) {
+      clearInterval(this.participantPollHandle);
+      this.participantPollHandle = null;
+    }
   }
 
   /** Gates hardware mic capture to match Teams roster mute for the configured local name. */
   private startMuteTracker(): void {
+    if (!isRosterAutomationEnabled()) {
+      console.log('[bot] Mute tracker skipped (DISABLE_ROSTER_AUTOMATION is on).');
+      return;
+    }
     const localName = getLocalParticipantName();
     if (process.platform !== 'win32' || !localName || !this.page) return;
 
@@ -386,6 +529,16 @@ export class TeamsGuestBot {
   private stopMuteTracker(): void {
     this.muteTracker?.stop();
     this.muteTracker = null;
+  }
+
+  public async getMeetingTitle(): Promise<string | null> {
+    if (!this.page) return null;
+    try {
+      return await readMeetingTitle(this.page);
+    } catch (err) {
+      console.warn('[bot] Could not read meeting title:', err);
+      return null;
+    }
   }
 
   public async debugRosterHtml(): Promise<string> {
@@ -405,5 +558,22 @@ export class TeamsGuestBot {
       }
       return document.body.innerHTML;
     });
+  }
+
+  /**
+   * Dump HTML from the active meeting page for selector discovery (Meeting info, dialogs, etc.).
+   * Optional selector targets a specific element; otherwise prefers the topmost [role="dialog"].
+   */
+  public async debugPageHtml(selector?: string): Promise<string> {
+    if (!this.page) return 'No active meeting page.';
+    return this.page.evaluate((sel) => {
+      if (sel) {
+        const el = document.querySelector(sel);
+        return el ? el.outerHTML : `No element found matching "${sel}"`;
+      }
+      // Teams popups/panels often use Fluent UI role="dialog" — smaller than the whole page.
+      const dialog = document.querySelector('[role="dialog"]');
+      return dialog ? dialog.outerHTML : document.body.innerHTML;
+    }, selector);
   }
 }

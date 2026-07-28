@@ -72,8 +72,8 @@ public class UiWin {
     if (string.IsNullOrEmpty(t)) return false;
     return t.IndexOf("Meeting Assi", StringComparison.OrdinalIgnoreCase) >= 0
         || t.IndexOf("e& Meeting", StringComparison.OrdinalIgnoreCase) >= 0
-        || t.IndexOf("localhost:3000", StringComparison.OrdinalIgnoreCase) >= 0
-        || t.IndexOf("127.0.0.1:3000", StringComparison.OrdinalIgnoreCase) >= 0;
+        || t.IndexOf("localhost:", StringComparison.OrdinalIgnoreCase) >= 0
+        || t.IndexOf("127.0.0.1:", StringComparison.OrdinalIgnoreCase) >= 0;
   }
 
   static bool IsChromeFamily(string cls) {

@@ -10,6 +10,8 @@ export interface BotStatus {
   paused?: boolean;
   audioLevel?: number;
   localMicOpen?: boolean;
+  /** Countdown seconds until auto-leave when the bot is alone in the meeting. */
+  aloneLeaveInSeconds?: number;
 }
 
 export interface RecordingItem {
@@ -25,6 +27,15 @@ export interface TranscriptItem {
   title: string;
   type: string;
   lastModified: string;
+}
+
+export interface SummaryItem {
+  id: string;
+  title: string;
+  text: string;
+  lastModified: string;
+  /** Source transcript file — used to decide Summarize vs View Summary. */
+  transcriptFileName: string;
 }
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
@@ -120,6 +131,37 @@ export function fetchTranscript(fileName: string): Promise<string> {
   return fetch(`/transcripts/${encodeURIComponent(fileName)}`).then(async (res) => {
     if (!res.ok) throw new Error("Could not load transcript");
     return res.text();
+  });
+}
+
+/** Upload a local .txt file as a transcript (saved as *.transcript.txt on the server). */
+export async function uploadTranscript(file: File): Promise<TranscriptItem> {
+  if (!file.name.toLowerCase().endsWith(".txt")) {
+    throw new Error("Only .txt files are accepted");
+  }
+  const content = await file.text();
+  return api<TranscriptItem>("/transcripts", {
+    method: "POST",
+    body: JSON.stringify({
+      content,
+      originalFileName: file.name,
+    }),
+  });
+}
+
+export function listSummaries(): Promise<SummaryItem[]> {
+  return api<SummaryItem[]>("/summaries");
+}
+
+export function listAvailableModels(): Promise<string[]> {
+  return api<{ models: string[] }>("/api/models").then((r) => r.models);
+}
+
+/** Manually generate a summary for a transcript (no auto-trigger). */
+export function generateSummary(transcriptFileName: string, model?: string): Promise<SummaryItem> {
+  return api<SummaryItem>("/summaries", {
+    method: "POST",
+    body: JSON.stringify({ transcriptFileName, ...(model ? { model } : {}) }),
   });
 }
 

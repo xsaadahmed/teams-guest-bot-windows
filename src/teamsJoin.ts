@@ -1,4 +1,4 @@
-import { Page } from '@playwright/test';
+import { Page, type Frame } from '@playwright/test';
 import { dismissNativeProtocolDialogBestEffort } from './browserLaunch';
 
 const NAME_INPUT_SELECTORS = [
@@ -161,21 +161,99 @@ async function readRosterButtonLabel(page: Page): Promise<string | null> {
   return null;
 }
 
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Teams shows a full-screen modal when mic/camera are blocked at the browser level:
+ * "Are you sure you don't want audio or video?" with a "Continue without audio or video" button.
+ * Until dismissed it blocks roster, mute icons, and most meeting controls.
+ */
+export async function dismissAvPermissionModalIfPresent(page: Page): Promise<boolean> {
+  if (page.isClosed()) return false;
+
+  const tryContext = async (ctx: Page | Frame): Promise<boolean> => {
+    try {
+      const byRole = ctx.getByRole('button', { name: /continue without audio or video/i });
+      if ((await byRole.count()) > 0) {
+        await byRole.first().click({ timeout: 2000 });
+        return true;
+      }
+    } catch {
+      // not visible / not clickable
+    }
+
+    try {
+      return await ctx.evaluate(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        const looksLikeAvModal =
+          body.includes("don't want audio") || body.includes('continue without audio or video');
+        if (!looksLikeAvModal) return false;
+
+        for (const el of Array.from(document.querySelectorAll('button, [role="button"]'))) {
+          const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          if (text.includes('continue without audio')) {
+            (el as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+    } catch {
+      return false;
+    }
+  };
+
+  if (await tryContext(page)) {
+    console.log('[teamsJoin] Dismissed "Continue without audio or video" modal');
+    await sleep(600);
+    return true;
+  }
+
+  for (const frame of page.frames()) {
+    if (await tryContext(frame)) {
+      console.log('[teamsJoin] Dismissed "Continue without audio or video" modal (iframe)');
+      await sleep(600);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/** Poll while in-meeting — the AV modal can appear late and block roster/mute scraping. */
+export function startAvPermissionModalWatcher(page: Page): () => void {
+  const interval = setInterval(() => {
+    if (page.isClosed()) return;
+    void dismissAvPermissionModalIfPresent(page);
+  }, 2000);
+  return () => clearInterval(interval);
+}
+
+/** When false, the bot never clicks the People/roster button (manual UI debugging). */
+export function isRosterAutomationEnabled(): boolean {
+  const raw = (process.env.DISABLE_ROSTER_AUTOMATION ?? '').trim().toLowerCase();
+  return raw !== '1' && raw !== 'true' && raw !== 'yes';
+}
+
 /**
  * Idempotent: does nothing if the roster panel is already open. Both getParticipantCount()
  * and roster-side readers call this before reading from the panel — the one place that
  * decides whether to click the roster button. Once opened, nothing closes it again.
+ *
+ * Set DISABLE_ROSTER_AUTOMATION=1 to skip opening the roster (e.g. while inspecting
+ * Meeting info or other side panels manually).
  */
 export async function ensureRosterPanelOpen(page: Page): Promise<void> {
+  await dismissAvPermissionModalIfPresent(page);
+  if (!isRosterAutomationEnabled()) return;
+
   const alreadyOpen = (await countParticipantsFromDom(page)).count !== null;
   if (!alreadyOpen) {
     await clickRosterButton(page);
     await sleep(2000); // give Teams time to render the panel content
   }
-}
-
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -575,6 +653,9 @@ export async function joinTeamsMeeting(
       console.log(`[teamsJoin] Still on launcher (${page.url()}) — retrying Continue…`);
     }
 
+    if (await dismissAvPermissionModalIfPresent(page)) {
+      await sleep(500);
+    }
     if (await clickPreJoinControl(page, 'Continue without audio or video')) {
       console.log('[teamsJoin] Clicked "Continue without audio or video"');
       await sleep(1000);
@@ -619,6 +700,7 @@ export async function joinTeamsMeeting(
   while (Date.now() - start < maxWaitMs) {
     page = await pickActiveJoinPage(page);
     await ensureNotOnMarketingPage(page, joinUrl);
+    await dismissAvPermissionModalIfPresent(page);
 
     // Keep dismissing the launcher if Teams bounced us back.
     for (const p of page.context().pages()) {
@@ -666,6 +748,74 @@ const MORE_BUTTON_SELECTORS = [
   'button[data-tid="callingButtons-showMoreBtn"]',
   'button[id*="showMore" i]',
 ];
+
+/**
+ * Opens Meeting info if needed and reads `[data-tid="call-title"]`.
+ * Closes the panel afterward (Escape) so chat/roster side panels are not blocked.
+ */
+export async function readMeetingTitle(page: Page): Promise<string | null> {
+  const contexts: Array<Page | Frame> = [page, ...page.frames()];
+
+  const readTitle = async (ctx: Page | Frame): Promise<string | null> => {
+    try {
+      const loc = ctx.locator('[data-tid="call-title"]');
+      if (!(await loc.isVisible().catch(() => false))) return null;
+      const text = (await loc.textContent())?.trim();
+      return text || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const openMeetingInfo = async (ctx: Page | Frame): Promise<boolean> => {
+    try {
+      for (const sel of MORE_BUTTON_SELECTORS) {
+        const more = ctx.locator(sel).first();
+        if (!(await more.isVisible().catch(() => false))) continue;
+        await more.click();
+        await sleep(600);
+        const item = ctx.getByRole('menuitem', { name: /meeting info/i });
+        if (await item.isVisible().catch(() => false)) {
+          await item.click();
+          await ctx.locator('[data-tid="call-title"]').waitFor({ timeout: 5000 }).catch(() => null);
+          return true;
+        }
+        await page.keyboard.press('Escape').catch(() => undefined);
+      }
+      return false;
+    } catch (err) {
+      console.warn('[teamsJoin] Could not open Meeting info:', err);
+      return false;
+    }
+  };
+
+  const closePanel = async (): Promise<void> => {
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await sleep(200);
+  };
+
+  for (const ctx of contexts) {
+    const existing = await readTitle(ctx);
+    if (existing) {
+      await closePanel();
+      console.log(`[teamsJoin] Meeting title: "${existing}"`);
+      return existing;
+    }
+  }
+
+  for (const ctx of contexts) {
+    if (!(await openMeetingInfo(ctx))) continue;
+    const title = (await readTitle(ctx)) || (await readTitle(page));
+    await closePanel();
+    if (title) {
+      console.log(`[teamsJoin] Meeting title: "${title}"`);
+      return title;
+    }
+  }
+
+  console.warn('[teamsJoin] Could not read meeting title from Meeting info panel.');
+  return null;
+}
 
 const CHAT_EDITOR_SELECTORS = [
   'div[data-tid="ckeditor"]',
@@ -1002,6 +1152,7 @@ export async function hasMeetingEnded(page: Page): Promise<boolean> {
  */
 export async function getParticipantCount(page: Page): Promise<number | null> {
   try {
+    await dismissAvPermissionModalIfPresent(page);
     const label = await readRosterButtonLabel(page);
     if (label) {
       const fromLabel = parseCountFromRosterLabel(label);

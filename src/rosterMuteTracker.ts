@@ -6,13 +6,20 @@ import { isLocalParticipantMuted } from './localParticipantMute';
  * mic gate (MIC 0/1 on the helper stdin). Loopback always records; hardware mic is
  * mixed in only while that participant shows as unmuted in the meeting.
  *
- * Fail-open: mic starts open and stays open until we successfully read a muted state
- * from the roster — avoids silent recordings when name matching hasn't found the row yet.
+ * Fail-open until the named participant first appears on the roster (join / name match).
+ * After that, disappearing from the roster is treated as having left — mic gate closes.
  */
 export class RosterMuteTracker {
   private handle: ReturnType<typeof setInterval> | null = null;
   private lastMicEnabled: boolean | null = null;
+  /** Log throttle while waiting for first roster match. */
   private nullPollStreak = 0;
+  /** True once we've successfully read mute state for this participant. */
+  private seenOnRoster = false;
+  /** Consecutive polls with no roster row after seenOnRoster (DOM flicker guard). */
+  private absentStreak = 0;
+  /** ~0.9s at 300ms poll — brief roster glitches should not close the mic. */
+  private static readonly ABSENT_CLOSE_POLLS = 3;
 
   constructor(
     private readonly page: Page,
@@ -23,8 +30,13 @@ export class RosterMuteTracker {
 
   public start(): void {
     if (this.handle) return;
-    console.log(`[muteTracker] Watching roster mute state for "${this.participantName}" (mic open until muted confirmed)`);
+    console.log(
+      `[muteTracker] Watching roster mute state for "${this.participantName}" (mic open until muted or left)`,
+    );
     this.lastMicEnabled = true;
+    this.seenOnRoster = false;
+    this.absentStreak = 0;
+    this.nullPollStreak = 0;
     this.onMicGateChange(true);
     this.handle = setInterval(() => {
       void this.poll();
@@ -43,16 +55,34 @@ export class RosterMuteTracker {
 
     const muted = await isLocalParticipantMuted(this.page, this.participantName);
     if (muted === null) {
-      this.nullPollStreak++;
-      if (this.nullPollStreak === 1 || this.nullPollStreak % 17 === 0) {
+      if (!this.seenOnRoster) {
+        this.nullPollStreak++;
+        if (this.nullPollStreak === 1 || this.nullPollStreak % 17 === 0) {
+          console.log(
+            `[muteTracker] Could not find "${this.participantName}" in roster yet — mic stays open`,
+          );
+        }
+        return;
+      }
+
+      this.absentStreak++;
+      if (this.absentStreak >= RosterMuteTracker.ABSENT_CLOSE_POLLS && this.lastMicEnabled !== false) {
+        this.lastMicEnabled = false;
+        this.onMicGateChange(false);
         console.log(
-          `[muteTracker] Could not find "${this.participantName}" in roster yet — mic stays open`,
+          `[muteTracker] "${this.participantName}" no longer on roster — mic gate closed (left meeting)`,
         );
       }
       return;
     }
 
+    if (!this.seenOnRoster) {
+      this.seenOnRoster = true;
+      console.log(`[muteTracker] Found "${this.participantName}" on roster`);
+    }
+    this.absentStreak = 0;
     this.nullPollStreak = 0;
+
     const micEnabled = !muted;
     if (micEnabled === this.lastMicEnabled) return;
 

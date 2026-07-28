@@ -7,6 +7,11 @@ Recordings/
 *.log
 .env
 .teams-bot-config.json
+join-payload.json
+join-payload-temp.json
+bot-restart.log.err
+Testing_*.transcript.txt
+Testing_*.captions.json
 test_stdin.txt
 windows/WasapiLoopbackRecorder/test.wav
 windows/test-*.js

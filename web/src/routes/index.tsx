@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Pause,
   Play,
@@ -20,15 +20,19 @@ import {
   Sun,
   Sparkles,
   Search,
+  Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   fetchTranscript,
+  generateSummary,
   getBotConfig,
   getBotStatus,
   joinMeeting,
   leaveMeeting,
   listRecordings,
+  listAvailableModels,
+  listSummaries,
   listTranscripts,
   pauseRecording,
   resumeRecording,
@@ -36,7 +40,9 @@ import {
   recordingDownloadUrl,
   recordingPlayUrl,
   saveBotConfig,
+  uploadTranscript,
   type RecordingItem,
+  type SummaryItem,
   type TranscriptItem,
 } from "../lib/bot-api";
 import { applyTheme, resolveTheme, toggleTheme, type Theme } from "../lib/theme";
@@ -55,7 +61,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Sidebar,
   SidebarContent,
@@ -92,6 +97,13 @@ import {
   PaginationPrevious,
 } from "@/components/ui/pagination";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 export const Route = createFileRoute("/")({
   component: Index,
@@ -146,10 +158,10 @@ function overlayTargetRect(collapsed: boolean) {
   return { ...size, left, top };
 }
 
-function windowMatchesSize(size: { width: number; height: number }, slack = 56): boolean {
+function windowMatchesSize(size: { width: number; height: number }, slack = 72): boolean {
   return (
     Math.abs(window.outerWidth - size.width) <= slack &&
-    Math.abs(window.outerHeight - size.height) <= slack + 24
+    Math.abs(window.outerHeight - size.height) <= slack + 32
   );
 }
 
@@ -163,12 +175,36 @@ function tryBrowserWindowLayout(size: { width: number; height: number }, left: n
   return windowMatchesSize(size);
 }
 
+/** Clear always-on-top and restore a normal main-window geometry (fixes Alt+Tab lock). */
+function clearTopmostLayout(geometry?: WindowGeometry | null): void {
+  const g = normalizeMainGeometry(geometry ?? captureWindowGeometry());
+  try {
+    window.resizeTo(g.width, g.height);
+    window.moveTo(g.x, g.y);
+  } catch {
+    // ignore
+  }
+  // Always attempt — even if we previously thought layout was blocked. A stuck HWND_TOPMOST
+  // is worse than a harmless EPERM warning.
+  void positionUiWindow({
+    width: g.width,
+    height: g.height,
+    left: g.x,
+    top: g.y,
+    topmost: false,
+  }).catch(() => undefined);
+}
+
 /**
- * Prefer shrinking the Edge --app window (home). If that fails (common on corporate
- * Edge where resizeTo is a silent no-op and PowerShell is EPERM), fall back to the
- * in-page fixed bottom-left mini card — same as the DevTools floating-div test.
+ * Prefer shrinking the Edge --app window (home). Returns:
+ * - "os" when the outer window is confirmed small
+ * - "pending" while Win32/browser resize is still being tried
+ * - "inpage" only after probes failed (corporate fallback)
+ *
+ * Never sets HWND_TOPMOST until the window size is confirmed — otherwise a failed
+ * resize leaves a full-size always-on-top window that traps Alt+Tab.
  */
-function placeOverlayWindow(collapsed: boolean): "os" | "inpage" {
+function placeOverlayWindow(collapsed: boolean): "os" | "pending" | "inpage" {
   const { width, height, left, top } = overlayTargetRect(collapsed);
   const size = { width, height };
 
@@ -176,51 +212,24 @@ function placeOverlayWindow(collapsed: boolean): "os" | "inpage" {
     return "inpage";
   }
 
-  if (tryBrowserWindowLayout(size, left, top)) {
+  if (tryBrowserWindowLayout(size, left, top) || windowMatchesSize(size)) {
     osWindowLayoutCapable = true;
     void positionUiWindow({ ...size, left, top, topmost: true }).catch(() => undefined);
     return "os";
   }
 
-  // One Win32 attempt on machines where resizeTo fails but PowerShell works.
-  if (osWindowLayoutCapable === null) {
-    void positionUiWindow({ ...size, left, top, topmost: true })
-      .then(() => {
-        window.setTimeout(() => {
-          if (windowMatchesSize(size)) {
-            osWindowLayoutCapable = true;
-          } else {
-            osWindowLayoutCapable = false;
-          }
-        }, 200);
-      })
-      .catch(() => {
-        osWindowLayoutCapable = false;
-      });
+  // Ask Win32 to resize WITHOUT topmost first. Only pin topmost after size confirms.
+  if (osWindowLayoutCapable !== false) {
+    void positionUiWindow({ ...size, left, top, topmost: false }).catch(() => {
+      // Don't permanently disable here — transient spawn failures happen; finalize decides.
+    });
   }
 
-  return "inpage";
+  return "pending";
 }
 
 function restoreMainWindow(g: WindowGeometry | null) {
-  const geometry = normalizeMainGeometry(g);
-  try {
-    window.resizeTo(geometry.width, geometry.height);
-    window.moveTo(geometry.x, geometry.y);
-  } catch {
-    // ignore
-  }
-  // Skip PowerShell when we already know corp policy blocks it.
-  if (osWindowLayoutCapable === false) return;
-  void positionUiWindow({
-    width: geometry.width,
-    height: geometry.height,
-    left: geometry.x,
-    top: geometry.y,
-    topmost: false,
-  }).catch(() => {
-    osWindowLayoutCapable = false;
-  });
+  clearTopmostLayout(g);
 }
 
 function exitOverlayMode(
@@ -231,8 +240,8 @@ function exitOverlayMode(
   const restore = () => restoreMainWindow(g);
   restore();
   const timers = [50, 120, 220, 400, 800, 1400].map((ms) => window.setTimeout(restore, ms));
-  // Resize via Win32 before painting the full app into the tiny overlay frame.
-  const reveal = window.setTimeout(onRestored, 260);
+  // Reveal full UI after first restore attempts (don't wait for last retry).
+  const reveal = window.setTimeout(onRestored, 280);
   return () => {
     timers.forEach((id) => window.clearTimeout(id));
     window.clearTimeout(reveal);
@@ -242,6 +251,9 @@ function exitOverlayMode(
 function Index() {
   const [collapsed, setCollapsed] = useState(true);
   const [page, setPage] = useState<Page>("home");
+  /** Open this summary detail when navigating to AI Summaries (toast / View Summary). */
+  const [summaryFocusId, setSummaryFocusId] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string>("auto");
   const [overlayOnly, setOverlayOnly] = useState(false);
   /** When OS can't shrink Edge (corp), keep the mini recorder as an in-page floating card. */
   const [inPageOverlay, setInPageOverlay] = useState(false);
@@ -290,19 +302,9 @@ function Index() {
     }
   };
 
-  // On first load of the full UI, clear always-on-top when Win32 layout is available.
+  // On first load of the full UI, clear always-on-top (leftover from a previous stuck session).
   useEffect(() => {
-    if (osWindowLayoutCapable === false) return;
-    const g = captureWindowGeometry();
-    void positionUiWindow({
-      width: g.width,
-      height: g.height,
-      left: g.x,
-      top: g.y,
-      topmost: false,
-    }).catch(() => {
-      osWindowLayoutCapable = false;
-    });
+    clearTopmostLayout(captureWindowGeometry());
   }, []);
 
   useEffect(() => {
@@ -314,51 +316,67 @@ function Index() {
         savedGeometry.current = captureWindowGeometry();
       }
       miniCollapsedRef.current = false;
+      // Re-probe each meeting — don't permanently lock home machines into in-page mode
+      // after one flaky Edge resizeTo attempt.
+      osWindowLayoutCapable = null;
+      setInPageOverlay(false);
       setOverlayOnly(true);
     }, 1500);
 
     return () => window.clearTimeout(t);
   }, [recorder.mode]);
 
-  // Probe OS resize once; if blocked, lock into in-page floating card (Option A).
+  // Probe OS resize; prefer real floating mini window. Fall back to in-page card only after
+  // retries fail — and always clear topmost when falling back (prevents Alt+Tab lock).
   useEffect(() => {
     if (!overlayOnly) return;
 
-    const apply = () => {
+    let cancelled = false;
+    let decided = false;
+
+    const commitOs = () => {
+      if (cancelled || decided) return;
+      decided = true;
+      osWindowLayoutCapable = true;
+      setInPageOverlay(false);
+      const { width, height, left, top } = overlayTargetRect(miniCollapsedRef.current);
+      void positionUiWindow({ width, height, left, top, topmost: true }).catch(() => undefined);
+    };
+
+    const commitInPage = () => {
+      if (cancelled || decided) return;
+      decided = true;
+      osWindowLayoutCapable = false;
+      setInPageOverlay(true);
+      // Critical: clear any HWND_TOPMOST from probe attempts so Alt+Tab works again.
+      clearTopmostLayout(savedGeometry.current);
+    };
+
+    const probe = () => {
+      if (cancelled || decided) return;
       const mode = placeOverlayWindow(miniCollapsedRef.current);
-      if (mode === "inpage" || osWindowLayoutCapable === false) {
-        setInPageOverlay(true);
-      } else {
-        setInPageOverlay(false);
+      if (mode === "os") {
+        commitOs();
       }
     };
 
-    apply();
-    // Few short retries only while capability is still unknown (home Edge often needs a beat).
-    const delays =
-      osWindowLayoutCapable === false ? [] : [80, 200, 500, 1000];
-    const timers = delays.map((ms) =>
-      window.setTimeout(() => {
-        if (osWindowLayoutCapable === false) {
-          setInPageOverlay(true);
-          return;
-        }
-        apply();
-      }, ms),
-    );
-    // After probes, decide: OS-shrunk window vs in-page floating card.
+    probe();
+    const delays = [100, 250, 500, 900, 1500, 2200];
+    const timers = delays.map((ms) => window.setTimeout(probe, ms));
+
+    // After probes, lock decision. Prefer OS if size matches; otherwise in-page.
     const finalize = window.setTimeout(() => {
+      if (cancelled || decided) return;
       const size = miniCollapsedRef.current ? OVERLAY_COLLAPSED : OVERLAY_EXPANDED;
       if (windowMatchesSize(size)) {
-        osWindowLayoutCapable = true;
-        setInPageOverlay(false);
+        commitOs();
       } else {
-        osWindowLayoutCapable = false;
-        setInPageOverlay(true);
+        commitInPage();
       }
-    }, 1400);
+    }, 2800);
 
     return () => {
+      cancelled = true;
       timers.forEach((id) => window.clearTimeout(id));
       window.clearTimeout(finalize);
     };
@@ -370,6 +388,8 @@ function Index() {
 
     const g = savedGeometry.current;
     savedGeometry.current = null;
+    // Always clear topmost on leave — even if we used in-page fallback mid-session.
+    clearTopmostLayout(g);
     return exitOverlayMode(g, () => {
       setOverlayOnly(false);
       setInPageOverlay(false);
@@ -412,7 +432,12 @@ function Index() {
           onChromeCollapseChange={(miniCollapsed) => {
             miniCollapsedRef.current = miniCollapsed;
             const mode = placeOverlayWindow(miniCollapsed);
-            if (mode === "inpage") setInPageOverlay(true);
+            if (mode === "os") {
+              setInPageOverlay(false);
+            } else if (mode === "inpage") {
+              setInPageOverlay(true);
+              clearTopmostLayout(savedGeometry.current);
+            }
           }}
         />
       </div>,
@@ -471,9 +496,19 @@ function Index() {
         <SidebarInset className="flex min-h-0 flex-1 flex-col overflow-auto">
           {page === "home" && <HomePage setPage={setPage} />}
           {page === "recording" && <RecordingPage />}
-          {page === "notes" && <NotesPage setPage={setPage} />}
+          {page === "notes" && (
+            <NotesPage setPage={setPage} selectedModel={selectedModel} />
+          )}
           {page === "recordings" && <RecordingsPage setPage={setPage} />}
-          {page === "summaries" && <SummariesPage setPage={setPage} />}
+          {page === "summaries" && (
+            <SummariesPage
+              setPage={setPage}
+              focusSummaryId={summaryFocusId}
+              onFocusConsumed={() => setSummaryFocusId(null)}
+              selectedModel={selectedModel}
+              onSelectedModelChange={setSelectedModel}
+            />
+          )}
           {page === "info" && <AboutPage />}
         </SidebarInset>
         <DockedMeetingAssistant
@@ -631,20 +666,24 @@ function AppSidebar({
 
 /* ---------------- Page layout shells ---------------- */
 
-/** Wide pages (Home grid, Summaries). */
+/** Wide pages (Home grid). */
 const PAGE_WIDE = "mx-auto w-full max-w-[1400px] px-6 py-8 lg:px-10";
-/** Single centered shell for Transcripts + Recordings list pages. */
+/** Shared centered shell for Transcripts, Recordings, and AI Summaries. */
 const LIST_PAGE = "mx-auto w-full max-w-5xl px-6 py-8";
-/** Summaries table block (unchanged from round 3). */
-const TABLE_BLOCK = "max-w-3xl";
 const LIST_PAGE_SIZE = 18;
+/** Fixed width only for Summarize ↔ View Summary (label changes); View sizes naturally. */
+const SUMMARIZE_ACTION_BTN = "w-[122px] justify-center gap-1 px-3 [&_svg]:size-3.5";
+const SUMMARIZE_OUTLINE =
+  "border-violet-500/40 text-violet-700 hover:bg-violet-500/10 hover:text-violet-800 dark:text-violet-300 dark:hover:text-violet-200";
+const SUMMARIZE_FILLED =
+  "border-transparent bg-violet-600 text-white shadow-sm hover:bg-violet-500 hover:text-white dark:bg-violet-500 dark:hover:bg-violet-400";
 
 const BROWSE_CARD_ACCENT = "text-muted-foreground bg-secondary";
 const BROWSE_CARD_CLASS =
   "border-border/80 bg-secondary/30 hover:border-border hover:bg-secondary/40 hover:shadow-sm";
 
 /** Narrow/form pages (Record, About) — fill the inset and center the panel. */
-function PageFormCenter({ children }: { children: React.ReactNode }) {
+function PageFormCenter({ children }: { children: ReactNode }) {
   return (
     <div className="flex flex-1 min-h-0 w-full items-center justify-center px-6 py-8">
       {children}
@@ -652,51 +691,100 @@ function PageFormCenter({ children }: { children: React.ReactNode }) {
   );
 }
 
-function PageWide({ children, className }: { children: React.ReactNode; className?: string }) {
+function PageWide({ children, className }: { children: ReactNode; className?: string }) {
   return <div className={cn(PAGE_WIDE, className)}>{children}</div>;
 }
 
-function ListPageShell({ children }: { children: React.ReactNode }) {
+function ListPageShell({ children }: { children: ReactNode }) {
   return <div className={LIST_PAGE}>{children}</div>;
+}
+
+/** Shared Transcript / AI Summary detail chrome: copy top-right, close floats outside. */
+function DetailViewerDialog({
+  open,
+  onOpenChange,
+  title,
+  description,
+  copyText,
+  children,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  description?: string;
+  copyText?: string | null;
+  children: ReactNode;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        closeOutside
+        className="flex max-h-[85vh] max-w-2xl flex-col gap-4 overflow-visible"
+      >
+        <div className="flex shrink-0 items-center gap-3">
+          <DialogHeader className="min-w-0 flex-1 space-y-1.5 text-left sm:text-left">
+            <DialogTitle className="truncate">{title}</DialogTitle>
+            {description ? <DialogDescription>{description}</DialogDescription> : null}
+          </DialogHeader>
+          {copyText ? <CopyButton text={copyText} className="shrink-0" /> : null}
+        </div>
+        {children}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** "1 summary" / "2 summaries" (and transcript/recording). */
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return count === 1 ? singular : plural;
 }
 
 function PageHeader({
   title,
   description,
-  count,
-  countLabel,
+  action,
 }: {
   title: string;
   description?: string;
-  count?: number;
-  countLabel?: string;
+  /** Optional control vertically centered against title + description. */
+  action?: ReactNode;
 }) {
   return (
     <div className="mb-6">
-      <div className="flex items-baseline gap-3">
-        <h1 className="text-2xl font-semibold leading-none">{title}</h1>
-        {count != null && countLabel && (
-          <Badge
-            variant="secondary"
-            className="shrink-0 leading-none translate-y-[-1px]"
-          >
-            {count} {countLabel}
-          </Badge>
-        )}
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold">{title}</h1>
+          {description ? (
+            <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+          ) : null}
+        </div>
+        {action ? <div className="shrink-0">{action}</div> : null}
       </div>
-      {description && <p className="text-sm text-muted-foreground mt-1">{description}</p>}
     </div>
   );
+}
+
+function listSearchPlaceholder(
+  count: number | undefined,
+  countLabel: string,
+  countLabelPlural?: string,
+): string {
+  const fallbackPlural = countLabelPlural ?? `${countLabel}s`;
+  if (count == null) return `Search ${fallbackPlural}...`;
+  return `Search ${count} ${pluralize(count, countLabel, countLabelPlural)}...`;
 }
 
 function ListSearch({
   value,
   onChange,
   placeholder,
+  ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder: string;
+  /** Static label for screen readers (placeholders are unreliable). */
+  ariaLabel: string;
 }) {
   return (
     <div className="relative mb-4 max-w-sm">
@@ -706,7 +794,7 @@ function ListSearch({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         className="pl-8"
-        aria-label={placeholder}
+        aria-label={ariaLabel}
       />
     </div>
   );
@@ -732,17 +820,21 @@ function TruncatedTitle({ title, subtitle }: { title: string; subtitle?: string 
 
 function ListEmptyState({
   message,
-  onRecord,
+  ctaLabel = "Go to Record",
+  ctaIcon,
+  onCta,
 }: {
   message: string;
-  onRecord: () => void;
+  ctaLabel?: string;
+  ctaIcon?: ReactNode;
+  onCta: () => void;
 }) {
   return (
     <div className="flex max-w-md flex-col items-center rounded-md border border-dashed bg-muted/20 px-6 py-12 text-center">
       <p className="text-sm text-muted-foreground">{message}</p>
-      <Button className="mt-4" variant="default" onClick={onRecord}>
-        <Mic className="h-4 w-4" />
-        Go to Record
+      <Button className="mt-4" variant="default" onClick={onCta}>
+        {ctaIcon ?? <Mic className="h-4 w-4" />}
+        {ctaLabel}
       </Button>
     </div>
   );
@@ -766,7 +858,7 @@ function ListTableSkeleton({ variant }: { variant: "transcripts" | "recordings" 
             <Skeleton className="h-4 w-28" />
           </TableCell>
           <TableCell className="text-right">
-            <Skeleton className="ml-auto h-8 w-16" />
+            <Skeleton className="ml-auto h-8 w-36" />
           </TableCell>
         </TableRow>
       ))}
@@ -945,17 +1037,63 @@ function HomePage({ setPage }: { setPage: (p: Page) => void }) {
   );
 }
 
-type SummaryItem = {
-  id: string;
-  title: string;
-  text: string;
-  lastModified: string;
-};
-
-function SummariesPage({ setPage }: { setPage: (p: Page) => void }) {
-  const [items] = useState<SummaryItem[]>([]);
+function SummariesPage({
+  setPage,
+  focusSummaryId,
+  onFocusConsumed,
+  selectedModel,
+  onSelectedModelChange,
+}: {
+  setPage: (p: Page) => void;
+  focusSummaryId?: string | null;
+  onFocusConsumed?: () => void;
+  selectedModel: string;
+  onSelectedModelChange: (model: string) => void;
+}) {
+  const [items, setItems] = useState<SummaryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [viewingId, setViewingId] = useState<string | null>(null);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    listSummaries()
+      .then(setItems)
+      .catch((e) => setError((e as Error).message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setModelsLoading(true);
+    setModelsError(null);
+    listAvailableModels()
+      .then((models) => {
+        if (cancelled) return;
+        setAvailableModels(models);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setModelsError((e as Error).message);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setModelsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!focusSummaryId) return;
+    setViewingId(focusSummaryId);
+    onFocusConsumed?.();
+  }, [focusSummaryId, onFocusConsumed]);
 
   const q = query.trim().toLowerCase();
   const filtered = q
@@ -965,24 +1103,110 @@ function SummariesPage({ setPage }: { setPage: (p: Page) => void }) {
 
   const activeItem = items.find((s) => s.id === viewingId);
 
+  const summarySearchPlaceholder = listSearchPlaceholder(
+    loading ? undefined : items.length,
+    "summary",
+    "summaries",
+  );
+
   return (
-    <PageWide>
+    <ListPageShell>
       <PageHeader
         title="AI Summaries"
         description="AI-generated summaries of your recorded meetings"
-        count={items.length > 0 ? items.length : undefined}
-        countLabel="summaries"
+        action={
+          <div className="flex shrink-0 items-center gap-3">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-muted-foreground">Model</span>
+              <Select value={selectedModel} onValueChange={onSelectedModelChange}>
+                <SelectTrigger
+                  className="h-8 w-[100px] px-3 text-xs"
+                  aria-label="Summarization model"
+                  disabled={modelsLoading && selectedModel !== "auto"}
+                >
+                  <SelectValue placeholder="Auto" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">Auto</SelectItem>
+                  {modelsLoading ? (
+                    <SelectItem value="__loading__" disabled>
+                      Loading...
+                    </SelectItem>
+                  ) : null}
+                  {!modelsLoading && modelsError ? (
+                    <SelectItem value="__error__" disabled>
+                      Models unavailable
+                    </SelectItem>
+                  ) : null}
+                  {!modelsLoading &&
+                    !modelsError &&
+                    availableModels.map((m) => (
+                      <SelectItem key={m} value={m}>
+                        {m}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button size="sm" className={SUMMARIZE_FILLED} onClick={() => setPage("notes")}>
+              <Sparkles className="h-4 w-4" />
+              Summarize a transcript
+            </Button>
+          </div>
+        }
       />
 
-      {items.length === 0 ? (
-        <ListEmptyState
-          message="No AI summaries yet — record a meeting first"
-          onRecord={() => setPage("recording")}
-        />
-      ) : (
+      {error && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>Error</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      {loading && (
         <>
-          <ListSearch value={query} onChange={setQuery} placeholder="Search summaries" />
-          <div className={cn("rounded-md border", TABLE_BLOCK)}>
+          <ListSearch
+            value={query}
+            onChange={setQuery}
+            placeholder={summarySearchPlaceholder}
+            ariaLabel="Search summaries"
+          />
+          <div className="rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="max-w-md">Title</TableHead>
+                  <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
+                  <TableHead className="w-[5.5rem]" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                <ListTableSkeleton variant="transcripts" />
+              </TableBody>
+            </Table>
+          </div>
+        </>
+      )}
+
+      {!loading && !error && items.length === 0 && (
+        <ListEmptyState
+          message="No AI summaries yet — generate one from a transcript"
+          ctaLabel="Go to Transcripts"
+          ctaIcon={<FileText className="h-4 w-4" />}
+          onCta={() => setPage("notes")}
+        />
+      )}
+
+      {!loading && items.length > 0 && (
+        <>
+          <ListSearch
+            value={query}
+            onChange={setQuery}
+            placeholder={summarySearchPlaceholder}
+            ariaLabel="Search summaries"
+          />
+          <div className="rounded-md border">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -1032,33 +1256,24 @@ function SummariesPage({ setPage }: { setPage: (p: Page) => void }) {
               </TableBody>
             </Table>
           </div>
-          <div className={TABLE_BLOCK}>
-            <ListPagination page={page} totalPages={totalPages} onPageChange={setListPage} />
-          </div>
+          <ListPagination page={page} totalPages={totalPages} onPageChange={setListPage} />
         </>
       )}
 
-      <Dialog open={viewingId !== null} onOpenChange={(open) => !open && setViewingId(null)}>
-        <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col">
-          <DialogHeader className="gap-2">
-            <div className="flex items-start justify-between gap-2 pr-8">
-              <div className="min-w-0">
-                <DialogTitle>{activeItem?.title ?? "AI Summary"}</DialogTitle>
-                <DialogDescription>
-                  {activeItem ? formatDate(activeItem.lastModified) : ""}
-                </DialogDescription>
-              </div>
-              {activeItem && <CopyButton text={activeItem.text} />}
-            </div>
-          </DialogHeader>
-          {activeItem && (
-            <ScrollArea className="flex-1 min-h-0 max-h-[60vh] rounded-md border bg-muted/20">
-              <pre className="p-4 text-sm whitespace-pre-wrap">{activeItem.text}</pre>
-            </ScrollArea>
-          )}
-        </DialogContent>
-      </Dialog>
-    </PageWide>
+      <DetailViewerDialog
+        open={viewingId !== null}
+        onOpenChange={(open) => !open && setViewingId(null)}
+        title={activeItem?.title ?? "AI Summary"}
+        description={activeItem ? formatDate(activeItem.lastModified) : undefined}
+        copyText={activeItem?.text}
+      >
+        {activeItem && (
+          <div className="min-h-0 max-h-[60vh] flex-1 overflow-y-auto rounded-md border bg-muted/20">
+            <pre className="p-4 text-sm whitespace-pre-wrap">{activeItem.text}</pre>
+          </div>
+        )}
+      </DetailViewerDialog>
+    </ListPageShell>
   );
 }
 
@@ -1150,8 +1365,16 @@ function recordingDisplayTitle(fileName: string) {
   return fileName.replace(/\.wav$/i, "");
 }
 
-function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
+function NotesPage({
+  setPage,
+  selectedModel,
+}: {
+  setPage: (p: Page) => void;
+  selectedModel: string;
+}) {
   const [items, setItems] = useState<TranscriptItem[]>([]);
+  const [summaryByTranscript, setSummaryByTranscript] = useState<Record<string, SummaryItem>>({});
+  const [summarizingFiles, setSummarizingFiles] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -1159,12 +1382,42 @@ function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
   const [textByFile, setTextByFile] = useState<Record<string, string>>({});
   const [loadingFile, setLoadingFile] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [viewingSummaryId, setViewingSummaryId] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
     listTranscripts()
-      .then(setItems)
-      .catch((e) => setError((e as Error).message))
-      .finally(() => setLoading(false));
+      .then((transcripts) => {
+        if (!cancelled) setItems(transcripts);
+      })
+      .catch((e) => {
+        if (!cancelled) setError((e as Error).message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    listSummaries()
+      .then((summaries) => {
+        if (cancelled) return;
+        const map: Record<string, SummaryItem> = {};
+        for (const s of summaries) {
+          if (s.transcriptFileName) map[s.transcriptFileName] = s;
+        }
+        setSummaryByTranscript(map);
+      })
+      .catch(() => {
+        /* Summarize actions still work; map stays empty until generate succeeds. */
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const openTranscript = async (fileName: string) => {
@@ -1183,6 +1436,49 @@ function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
     }
   };
 
+  const handleSummarize = async (t: TranscriptItem) => {
+    if (summaryByTranscript[t.fileName] || summarizingFiles[t.fileName]) return;
+    setSummarizingFiles((prev) => ({ ...prev, [t.fileName]: true }));
+    try {
+      const modelToUse = selectedModel === "auto" ? undefined : selectedModel;
+      const summary = await generateSummary(t.fileName, modelToUse);
+      setSummaryByTranscript((prev) => ({ ...prev, [t.fileName]: summary }));
+      toast.success(`Summary ready for ${summary.title || t.title}`, {
+        action: {
+          label: "View",
+          onClick: () => setViewingSummaryId(summary.id),
+        },
+      });
+    } catch (e) {
+      toast.error((e as Error).message || "Could not generate summary");
+    } finally {
+      setSummarizingFiles((prev) => {
+        const next = { ...prev };
+        delete next[t.fileName];
+        return next;
+      });
+    }
+  };
+
+  const handleUploadFile = async (file: File | undefined) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".txt")) {
+      toast.error("Only .txt files are accepted");
+      return;
+    }
+    setUploading(true);
+    try {
+      const item = await uploadTranscript(file);
+      setItems((prev) => [item, ...prev.filter((t) => t.fileName !== item.fileName)]);
+      toast.success(`Uploaded “${item.title}”`);
+    } catch (e) {
+      toast.error((e as Error).message || "Upload failed");
+    } finally {
+      setUploading(false);
+      if (uploadInputRef.current) uploadInputRef.current.value = "";
+    }
+  };
+
   const q = query.trim().toLowerCase();
   const filtered = q
     ? items.filter(
@@ -1196,14 +1492,44 @@ function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
 
   const activeItem = items.find((t) => t.fileName === viewingFile);
   const activeText = viewingFile ? textByFile[viewingFile] : "";
+  const activeSummary = viewingSummaryId
+    ? Object.values(summaryByTranscript).find((s) => s.id === viewingSummaryId) ?? null
+    : null;
+
+  const transcriptSearchPlaceholder = listSearchPlaceholder(
+    loading ? undefined : items.length,
+    "transcript",
+  );
 
   return (
     <ListPageShell>
       <PageHeader
         title="Transcripts"
         description="Speaker-labeled transcripts from your recordings"
-        count={loading ? undefined : items.length}
-        countLabel="transcripts"
+        action={
+          <div className="flex shrink-0 items-center gap-3">
+            <input
+              ref={uploadInputRef}
+              type="file"
+              accept=".txt,text/plain"
+              className="hidden"
+              onChange={(e) => void handleUploadFile(e.target.files?.[0])}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={uploading}
+              onClick={() => uploadInputRef.current?.click()}
+            >
+              {uploading ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Upload className="h-4 w-4" />
+              )}
+              {uploading ? "Uploading…" : "Upload"}
+            </Button>
+          </div>
+        }
       />
 
       {error && (
@@ -1216,14 +1542,19 @@ function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
 
       {loading && (
         <>
-          <ListSearch value={query} onChange={setQuery} placeholder="Search transcripts" />
+          <ListSearch
+            value={query}
+            onChange={setQuery}
+            placeholder={transcriptSearchPlaceholder}
+            ariaLabel="Search transcripts"
+          />
           <div className="rounded-md border">
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead className="max-w-md">Title</TableHead>
                   <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[5.5rem]" />
+                  <TableHead className="w-[13.5rem]" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1237,20 +1568,25 @@ function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
       {!loading && !error && items.length === 0 && (
         <ListEmptyState
           message="No transcripts yet — record a meeting first"
-          onRecord={() => setPage("recording")}
+          onCta={() => setPage("recording")}
         />
       )}
 
       {!loading && items.length > 0 && (
         <>
-          <ListSearch value={query} onChange={setQuery} placeholder="Search transcripts" />
+          <ListSearch
+            value={query}
+            onChange={setQuery}
+            placeholder={transcriptSearchPlaceholder}
+            ariaLabel="Search transcripts"
+          />
           <div className="rounded-md border">
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead className="max-w-md">Title</TableHead>
                   <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[5.5rem]" />
+                  <TableHead className="w-[13.5rem]" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1261,35 +1597,73 @@ function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  pageItems.map((t) => (
-                    <TableRow
-                      key={t.fileName}
-                      className="cursor-pointer hover:bg-muted/50"
-                      onClick={() => void openTranscript(t.fileName)}
-                    >
-                      <TableCell className="max-w-md">
-                        <TruncatedTitle
-                          title={t.title}
-                          subtitle={formatRelativeTime(t.lastModified)}
-                        />
-                      </TableCell>
-                      <TableCell className="text-muted-foreground whitespace-nowrap">
-                        {formatDate(t.lastModified)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void openTranscript(t.fileName);
-                          }}
-                        >
-                          View
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))
+                  pageItems.map((t) => {
+                    const existing = summaryByTranscript[t.fileName];
+                    const busy = !!summarizingFiles[t.fileName];
+                    return (
+                      <TableRow
+                        key={t.fileName}
+                        className="cursor-pointer hover:bg-muted/50"
+                        onClick={() => void openTranscript(t.fileName)}
+                      >
+                        <TableCell className="max-w-md">
+                          <TruncatedTitle
+                            title={t.title}
+                            subtitle={formatRelativeTime(t.lastModified)}
+                          />
+                        </TableCell>
+                        <TableCell className="text-muted-foreground whitespace-nowrap">
+                          {formatDate(t.lastModified)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="px-4"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void openTranscript(t.fileName);
+                              }}
+                            >
+                              View
+                            </Button>
+                            {existing ? (
+                              <Button
+                                size="sm"
+                                className={cn(SUMMARIZE_ACTION_BTN, SUMMARIZE_FILLED)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setViewingSummaryId(existing.id);
+                                }}
+                              >
+                                <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                                View Summary
+                              </Button>
+                            ) : (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={busy}
+                                className={cn(SUMMARIZE_ACTION_BTN, SUMMARIZE_OUTLINE)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleSummarize(t);
+                                }}
+                              >
+                                {busy ? (
+                                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                                ) : (
+                                  <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                                )}
+                                {busy ? "Summarizing…" : "Summarize"}
+                              </Button>
+                            )}
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })
                 )}
               </TableBody>
             </Table>
@@ -1298,39 +1672,46 @@ function NotesPage({ setPage }: { setPage: (p: Page) => void }) {
         </>
       )}
 
-      <Dialog open={viewingFile !== null} onOpenChange={(open) => !open && setViewingFile(null)}>
-        <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col">
-          <DialogHeader className="gap-2">
-            <div className="flex items-start justify-between gap-2 pr-8">
-              <div className="min-w-0">
-                <DialogTitle>{activeItem?.title ?? "Transcript"}</DialogTitle>
-                <DialogDescription>
-                  {activeItem ? formatDate(activeItem.lastModified) : ""}
-                </DialogDescription>
-              </div>
-              {activeText && <CopyButton text={activeText} />}
-            </div>
-          </DialogHeader>
-          {loadingFile === viewingFile && (
-            <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Loading transcript…
-            </div>
-          )}
-          {loadError && viewingFile && (
-            <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertTitle>Could not load transcript</AlertTitle>
-              <AlertDescription>{loadError}</AlertDescription>
-            </Alert>
-          )}
-          {viewingFile && textByFile[viewingFile] && (
-            <ScrollArea className="flex-1 min-h-0 max-h-[60vh] rounded-md border bg-muted/20">
-              <pre className="p-4 text-xs whitespace-pre-wrap font-mono">{textByFile[viewingFile]}</pre>
-            </ScrollArea>
-          )}
-        </DialogContent>
-      </Dialog>
+      <DetailViewerDialog
+        open={viewingFile !== null}
+        onOpenChange={(open) => !open && setViewingFile(null)}
+        title={activeItem?.title ?? "Transcript"}
+        description={activeItem ? formatDate(activeItem.lastModified) : undefined}
+        copyText={activeText || null}
+      >
+        {loadingFile === viewingFile && (
+          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading transcript…
+          </div>
+        )}
+        {loadError && viewingFile && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Could not load transcript</AlertTitle>
+            <AlertDescription>{loadError}</AlertDescription>
+          </Alert>
+        )}
+        {viewingFile && textByFile[viewingFile] && (
+          <div className="min-h-0 max-h-[60vh] flex-1 overflow-y-auto rounded-md border bg-muted/20">
+            <pre className="p-4 text-xs whitespace-pre-wrap font-mono">{textByFile[viewingFile]}</pre>
+          </div>
+        )}
+      </DetailViewerDialog>
+
+      <DetailViewerDialog
+        open={viewingSummaryId !== null}
+        onOpenChange={(open) => !open && setViewingSummaryId(null)}
+        title={activeSummary?.title ?? "AI Summary"}
+        description={activeSummary ? formatDate(activeSummary.lastModified) : undefined}
+        copyText={activeSummary?.text}
+      >
+        {activeSummary && (
+          <div className="min-h-0 max-h-[60vh] flex-1 overflow-y-auto rounded-md border bg-muted/20">
+            <pre className="p-4 text-sm whitespace-pre-wrap">{activeSummary.text}</pre>
+          </div>
+        )}
+      </DetailViewerDialog>
     </ListPageShell>
   );
 }
@@ -1357,13 +1738,16 @@ function RecordingsPage({ setPage }: { setPage: (p: Page) => void }) {
 
   const activeItem = items.find((r) => r.fileName === playingFile);
 
+  const recordingSearchPlaceholder = listSearchPlaceholder(
+    loading ? undefined : items.length,
+    "recording",
+  );
+
   return (
     <ListPageShell>
       <PageHeader
         title="Recordings"
         description="Play recordings in the browser or download WAV files"
-        count={loading ? undefined : items.length}
-        countLabel="recordings"
       />
 
       {error && (
@@ -1376,7 +1760,12 @@ function RecordingsPage({ setPage }: { setPage: (p: Page) => void }) {
 
       {loading && (
         <>
-          <ListSearch value={query} onChange={setQuery} placeholder="Search recordings" />
+          <ListSearch
+            value={query}
+            onChange={setQuery}
+            placeholder={recordingSearchPlaceholder}
+            ariaLabel="Search recordings"
+          />
           <div className="rounded-md border">
             <Table>
               <TableHeader>
@@ -1396,12 +1785,17 @@ function RecordingsPage({ setPage }: { setPage: (p: Page) => void }) {
       )}
 
       {!loading && !error && items.length === 0 && (
-        <ListEmptyState message="No recordings yet" onRecord={() => setPage("recording")} />
+        <ListEmptyState message="No recordings yet" onCta={() => setPage("recording")} />
       )}
 
       {!loading && items.length > 0 && (
         <>
-          <ListSearch value={query} onChange={setQuery} placeholder="Search recordings" />
+          <ListSearch
+            value={query}
+            onChange={setQuery}
+            placeholder={recordingSearchPlaceholder}
+            ariaLabel="Search recordings"
+          />
           <div className="rounded-md border">
             <Table>
               <TableHeader>
@@ -1529,12 +1923,13 @@ function useRecorder() {
   const [mode, setMode] = useState<Mode>("idle");
   const [paused, setPaused] = useState(false);
   const [seconds, setSeconds] = useState(0);
-  const [countdown, setCountdown] = useState(10);
+  const [countdown, setCountdown] = useState(5);
   const [returnProgress, setReturnProgress] = useState(100);
   const [error, setError] = useState<string | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
   const [localMicLevel, setLocalMicLevel] = useState(0);
   const [localMicOpen, setLocalMicOpen] = useState(true);
+  const [aloneLeaveInSeconds, setAloneLeaveInSeconds] = useState<number | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const joinedAtRef = useRef<number | null>(null);
 
@@ -1577,6 +1972,7 @@ function useRecorder() {
   useEffect(() => {
     if (mode !== "recording" && mode !== "saving" && mode !== "joining") {
       setAudioLevel(0);
+      setAloneLeaveInSeconds(null);
       return;
     }
     const id = setInterval(() => {
@@ -1588,6 +1984,7 @@ function useRecorder() {
               setMode("saving");
             }
             setAudioLevel(0);
+            setAloneLeaveInSeconds(null);
             return;
           }
           if (s.state === "idle" || s.state === "error") {
@@ -1595,6 +1992,7 @@ function useRecorder() {
               joinedAtRef.current = null;
               setPaused(false);
               setAudioLevel(0);
+              setAloneLeaveInSeconds(null);
               if (s.state === "error" && s.lastError) {
                 setError(s.lastError);
                 toast.error(s.lastError);
@@ -1607,6 +2005,9 @@ function useRecorder() {
           if (typeof s.paused === "boolean") setPaused(s.paused);
           if (typeof s.localMicOpen === "boolean") setLocalMicOpen(s.localMicOpen);
           setAudioLevel(typeof s.audioLevel === "number" ? s.audioLevel : 0);
+          setAloneLeaveInSeconds(
+            typeof s.aloneLeaveInSeconds === "number" ? s.aloneLeaveInSeconds : null,
+          );
         })
         .catch(() => undefined);
     }, 200);
@@ -1664,9 +2065,9 @@ function useRecorder() {
 
   useEffect(() => {
     if (mode !== "saved") return;
-    const totalMs = 10_000;
+    const totalMs = 5_000;
     const started = Date.now();
-    setCountdown(10);
+    setCountdown(5);
     setReturnProgress(100);
 
     let raf = 0;
@@ -1778,6 +2179,7 @@ function useRecorder() {
     countdown,
     returnProgress,
     error,
+    aloneLeaveInSeconds,
     audioLevel: Math.max(audioLevel, localMicOpen ? localMicLevel : 0),
     join,
     stop,
@@ -1811,19 +2213,28 @@ function RecorderPanel({ size = "mini", overlay = false }: { size?: "mini" | "la
 
       {r.mode === "idle" && (
         <>
-          <div className="space-y-2">
+          <form autoComplete="off" onSubmit={(e) => e.preventDefault()} className="space-y-2">
             <Label htmlFor="meeting-url" className={compact ? "text-xs" : undefined}>
               Paste Meeting URL:
             </Label>
             <Input
               id="meeting-url"
-              type="url"
+              name="teams-meeting-link"
+              type="text"
+              inputMode="url"
               value={r.url}
               onChange={(e) => r.setUrl(e.target.value)}
               placeholder="https://teams.microsoft.com/..."
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              data-form-type="other"
+              data-lpignore="true"
+              data-1p-ignore
               className={compact ? "h-8 text-xs" : undefined}
             />
-          </div>
+          </form>
 
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
@@ -1942,6 +2353,20 @@ function RecorderPanel({ size = "mini", overlay = false }: { size?: "mini" | "la
               </Badge>
             )}
           </div>
+
+          {r.mode === "recording" &&
+            r.aloneLeaveInSeconds != null &&
+            r.aloneLeaveInSeconds >= 0 && (
+              <p
+                className={cn(
+                  "rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-center text-amber-800 dark:text-amber-200",
+                  compact ? "text-[10px] leading-snug" : "text-xs",
+                )}
+              >
+                Bot alone in meeting, leaving in {r.aloneLeaveInSeconds}{" "}
+                {r.aloneLeaveInSeconds === 1 ? "second" : "seconds"}
+              </p>
+            )}
 
           <SoundWave
             active={r.mode === "recording" && !r.paused}

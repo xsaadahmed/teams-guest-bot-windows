@@ -68,10 +68,13 @@ echo Recordings directory: %RECORDINGS_DIR%
 if defined LOCAL_PARTICIPANT_NAME (
   echo Local participant [mute-gated mic]: %LOCAL_PARTICIPANT_NAME%
 ) else (
-  echo Local participant name: not set in env — Web UI will ask on first open ^(saved to .teams-bot-config.json^)
+  echo Local participant name: not set in env - Web UI will ask on first open ^(saved to .teams-bot-config.json^)
 )
 
 if not defined PORT set "PORT=3000"
+REM Optional: set DISABLE_ROSTER_AUTOMATION=1 to stop the bot opening the People panel (UI debugging).
+if "%DISABLE_ROSTER_AUTOMATION%"=="1" echo DISABLE_ROSTER_AUTOMATION=1 ^(People panel + mute tracker off^)
+if /i "%DISABLE_ROSTER_AUTOMATION%"=="true" echo DISABLE_ROSTER_AUTOMATION=true ^(People panel + mute tracker off^)
 echo Starting bot server on port %PORT%...
 echo Web UI: http://localhost:%PORT%/
 "%NODE_EXE%" build\server.js

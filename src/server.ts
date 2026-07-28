@@ -5,6 +5,14 @@ import * as path from 'path';
 import { TeamsGuestBot } from './bot';
 import { applyUiWindowLayout } from './uiWindow';
 import { bootstrapUserConfig, getLocalParticipantName, saveUserConfig } from './userConfig';
+import {
+  findSummaryByTranscript,
+  generateSummaryForTranscript,
+  getSummaryById,
+  listSummaries,
+} from './summaries';
+import { listAvailableModels } from './llmClient';
+import { isRosterAutomationEnabled } from './teamsJoin';
 
 bootstrapUserConfig();
 {
@@ -60,7 +68,7 @@ const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(process.cwd(), 'R
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 app.use(express.static(PUBLIC_DIR));
 
 const bot = new TeamsGuestBot();
@@ -285,9 +293,113 @@ app.get('/transcripts/:fileName', (req: Request, res: Response) => {
   res.send(fs.readFileSync(filePath, 'utf8'));
 });
 
+/**
+ * Upload a plain .txt transcript from the user's device.
+ * Body: { "content": "...", "originalFileName": "notes.txt" }
+ * Saved as `*.transcript.txt` so it appears in the Transcripts list and can be summarized.
+ */
+app.post('/transcripts', (req: Request, res: Response) => {
+  const content = req.body?.content;
+  const originalFileName =
+    typeof req.body?.originalFileName === 'string' ? req.body.originalFileName.trim() : '';
+
+  if (typeof content !== 'string' || !content.trim()) {
+    return res.status(400).json({ error: 'content is required.' });
+  }
+  if (!originalFileName || !originalFileName.toLowerCase().endsWith('.txt')) {
+    return res.status(400).json({ error: 'Only .txt files are accepted.' });
+  }
+
+  const baseName = path.basename(originalFileName).replace(/\.txt$/i, '');
+  const safe =
+    baseName
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80) || 'upload';
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const title = `${safe}_${stamp}`;
+  const fileName = `${title}.transcript.txt`;
+
+  if (!fs.existsSync(RECORDINGS_DIR)) {
+    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+  }
+  const filePath = path.join(RECORDINGS_DIR, fileName);
+  fs.writeFileSync(filePath, content, 'utf8');
+  const stat = fs.statSync(filePath);
+
+  res.status(201).json({
+    fileName,
+    title,
+    type: 'Uploaded',
+    lastModified: stat.mtime.toISOString(),
+  });
+});
+
+/** Lists AI summaries, newest first. */
+app.get('/summaries', (_req: Request, res: Response) => {
+  res.json(listSummaries());
+});
+
+/** Lists available completion models from the configured gateway. */
+app.get('/api/models', async (_req: Request, res: Response) => {
+  try {
+    const models = await listAvailableModels();
+    res.json({ models });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+/** Returns one summary by id (summary file name) or by source transcript file name. */
+app.get('/summaries/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  if (!id || id.includes('..') || path.basename(id) !== id) {
+    return res.status(400).json({ error: 'Invalid summary id.' });
+  }
+  const summary = getSummaryById(id) ?? (() => {
+    try {
+      return findSummaryByTranscript(id);
+    } catch {
+      return null;
+    }
+  })();
+  if (!summary) return res.status(404).json({ error: 'Not found.' });
+  res.json(summary);
+});
+
+/**
+ * Manually generate a summary for a transcript.
+ * Body: { "transcriptFileName": "....transcript.txt", "model"?: string }
+ * Idempotent if a summary already exists for that transcript.
+ */
+app.post('/summaries', async (req: Request, res: Response) => {
+  const transcriptFileName = req.body?.transcriptFileName;
+  if (typeof transcriptFileName !== 'string' || !transcriptFileName.trim()) {
+    return res.status(400).json({ error: 'transcriptFileName is required.' });
+  }
+  const model =
+    typeof req.body?.model === 'string' && req.body.model.trim() ? req.body.model.trim() : undefined;
+  try {
+    const summary = await generateSummaryForTranscript(transcriptFileName.trim(), model);
+    res.status(201).json(summary);
+  } catch (err) {
+    const message = (err as Error).message || 'Summary generation failed.';
+    const status = /not found/i.test(message) ? 404 : /invalid/i.test(message) ? 400 : 500;
+    res.status(status).json({ error: message });
+  }
+});
+
 app.get('/debug/roster-html', async (_req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/plain');
   res.send(await bot.debugRosterHtml());
+});
+
+/** Dump HTML from the bot's meeting page (optional ?selector= CSS selector). */
+app.get('/debug/page-html', async (req: Request, res: Response) => {
+  const selector = typeof req.query.selector === 'string' ? req.query.selector : undefined;
+  res.setHeader('Content-Type', 'text/plain');
+  res.send(await bot.debugPageHtml(selector));
 });
 
 // SPA fallback for cozy-meet-helper UI (after API routes).
@@ -308,6 +420,9 @@ app.listen(PORT, () => {
   console.log(`teams-guest-bot listening on :${PORT}`);
   console.log(`Web UI: http://localhost:${PORT}`);
   console.log(`Recordings directory: ${RECORDINGS_DIR}`);
+  if (!isRosterAutomationEnabled()) {
+    console.log('[server] DISABLE_ROSTER_AUTOMATION=1 — bot will not auto-open People (UI debugging).');
+  }
   // Slight delay so the server is accepting connections before the window loads.
   setTimeout(() => openWebUiWindow(PORT), 600);
 });

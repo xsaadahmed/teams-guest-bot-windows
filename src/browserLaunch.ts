@@ -57,6 +57,14 @@ function ensureBrowserProfileBlocksTeamsApp(): void {
     cameraExceptions[origin] = { setting: 2 };
   }
   exceptions.media_stream_camera = cameraExceptions;
+
+  // Pre-allow microphone for Teams so Chromium doesn't show the in-meeting
+  // "Continue without audio or video?" blocker modal (camera stays blocked above).
+  const micExceptions = (exceptions.media_stream_mic as Record<string, { setting: number }> | undefined) ?? {};
+  for (const origin of TEAMS_ORIGINS) {
+    micExceptions[origin] = { setting: 1 };
+  }
+  exceptions.media_stream_mic = micExceptions;
   contentSettings.exceptions = exceptions;
   profile.content_settings = contentSettings;
   prefs.profile = profile;
@@ -120,6 +128,13 @@ export async function dismissNativeProtocolDialogBestEffort(page?: Page): Promis
 /** Park Chromium far off-screen (normal window state — NOT minimized). */
 const OFFSCREEN_X = -32000;
 const OFFSCREEN_Y = 0;
+
+function defaultOnScreenPosition(): { x: number; y: number } {
+  return {
+    x: Number(process.env.BROWSER_RESTORE_X ?? 80),
+    y: Number(process.env.BROWSER_RESTORE_Y ?? 80),
+  };
+}
 
 /**
  * Silent join guard: shove Chromium off-screen and return OS focus to the user's window.
@@ -453,7 +468,6 @@ export async function launchTeamsBrowser(): Promise<LaunchedBrowser> {
  */
 export async function minimizeWindowBestEffort(context: BrowserContext, page: Page): Promise<void> {
   if (!IS_WINDOWS) return;
-  if (process.env.KEEP_BROWSER_VISIBLE === 'true' || process.env.KEEP_BROWSER_VISIBLE === '1') return;
   try {
     const cdp = await context.newCDPSession(page);
     const { windowId } = await cdp.send('Browser.getWindowForTarget');
@@ -482,8 +496,8 @@ export async function bringWindowOnScreenBestEffort(context: BrowserContext, pag
     await cdp.send('Browser.setWindowBounds', {
       windowId,
       bounds: {
-        left: Number(process.env.BROWSER_RESTORE_X ?? 80),
-        top: Number(process.env.BROWSER_RESTORE_Y ?? 80),
+        left: defaultOnScreenPosition().x,
+        top: defaultOnScreenPosition().y,
         width: Number(process.env.X11_WIDTH ?? 1280),
         height: Number(process.env.X11_HEIGHT ?? 720),
         windowState: 'normal',
@@ -503,9 +517,6 @@ export async function bringWindowOnScreenBestEffort(context: BrowserContext, pag
  */
 export function startManualBrowserRestoreWatcher(page: Page): () => void {
   if (!IS_WINDOWS) return () => undefined;
-  if (process.env.KEEP_BROWSER_VISIBLE === 'true' || process.env.KEEP_BROWSER_VISIBLE === '1') {
-    return () => undefined;
-  }
 
   let stopped = false;
 
