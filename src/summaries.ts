@@ -1,7 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
+import {
+  preprocessTranscript,
+  formatStatsLine,
+  EmptyTranscriptError,
+  resolveOptions,
+  type PreprocessOptions,
+} from './transcriptPreprocess';
+import { loadPreprocessInput, cleanArtifactPath } from './transcriptSidecars';
 import 'dotenv/config';
 import { summarizeTranscript } from './llmClient';
+import { getEffectiveLlmConfig } from './userConfig';
 
 export interface SummaryRecord {
   id: string;
@@ -10,9 +20,26 @@ export interface SummaryRecord {
   lastModified: string;
   /** Source transcript file name — stable key for "already summarized?" checks. */
   transcriptFileName: string;
+  /** sha256 of the exact preprocessed string sent to the LLM. Cache key. */
+  inputHash: string;
+  /** Model that produced this summary — a model change invalidates it. */
+  model: string;
+  /** Preprocess options in effect — an options change invalidates it. */
+  options: PreprocessOptions;
+  /** Stats line from preprocessing, for debugging. */
+  preprocessStats: string;
 }
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(process.cwd(), 'Recordings');
+
+/** Bot display name — filtered from the participants block. Approximate: bot.ts accepts a
+ *  per-meeting displayName override, so a renamed bot won't be caught. Fix properly by writing
+ *  the display name into .captions.json at finalizeTranscript() time. */
+const BOT_DISPLAY_NAME = process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant';
+
+function sha256(s: string): string {
+  return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+}
 
 function ensureRecordingsDir(): void {
   if (!fs.existsSync(RECORDINGS_DIR)) {
@@ -65,6 +92,10 @@ function readSummaryFile(filePath: string, fileName: string): SummaryRecord | nu
           ? raw.lastModified
           : stat.mtime.toISOString(),
       transcriptFileName,
+      inputHash: typeof raw.inputHash === 'string' ? raw.inputHash : '',
+      model: typeof raw.model === 'string' ? raw.model : '',
+      options: (raw.options ?? {}) as PreprocessOptions,
+      preprocessStats: typeof raw.preprocessStats === 'string' ? raw.preprocessStats : '',
     };
   } catch {
     return null;
@@ -112,14 +143,10 @@ export function getSummaryById(id: string): SummaryRecord | null {
 export async function generateSummaryForTranscript(
   transcriptFileName: string,
   model?: string,
+  force = false,
 ): Promise<SummaryRecord> {
   if (!isSafeTranscriptName(transcriptFileName)) {
     throw new Error('Invalid transcript file name.');
-  }
-
-  const existing = findSummaryByTranscript(transcriptFileName);
-  if (existing) {
-    return existing;
   }
 
   const transcriptPath = path.join(RECORDINGS_DIR, transcriptFileName);
@@ -127,20 +154,52 @@ export async function generateSummaryForTranscript(
     throw new Error('Transcript not found.');
   }
 
-  const transcript = fs.readFileSync(transcriptPath, 'utf8');
   const title = transcriptFileName
     .replace(/\.named_transcript\.txt$/i, '')
     .replace(/\.transcript\.txt$/i, '');
 
-  const text = await summarizeTranscript(transcript, title, model);
+  // Preprocess first: the cleaned text is the cache key, so we cannot decide staleness
+  // without it. This is local CPU only — no LLM call happens here.
+  const options = resolveOptions({ excludeSpeakers: [BOT_DISPLAY_NAME] });
+  let clean: string;
+  let statsLine: string;
+  try {
+    const result = preprocessTranscript(loadPreprocessInput(transcriptPath), options);
+    clean = result.text;
+    statsLine = formatStatsLine(result.stats);
+    console.log(`[summaries] ${transcriptFileName}: ${statsLine}`);
+    fs.writeFileSync(cleanArtifactPath(transcriptPath), clean, 'utf8');
+  } catch (err) {
+    if (err instanceof EmptyTranscriptError) throw new Error(err.message);
+    throw err;
+  }
+
+  const resolvedModel = model?.trim() || getEffectiveLlmConfig().model || '';
+  const inputHash = sha256(clean);
+
+  const existing = findSummaryByTranscript(transcriptFileName);
+  if (
+    !force &&
+    existing &&
+    existing.inputHash === inputHash &&
+    existing.model === resolvedModel
+  ) {
+    console.log(`[summaries] Reusing cached summary for ${transcriptFileName} (input unchanged).`);
+    return existing;
+  }
+
+  const text = await summarizeTranscript(clean, title, model);
   const outName = summaryFileNameForTranscript(transcriptFileName);
-  const now = new Date().toISOString();
   const record: SummaryRecord = {
     id: outName,
     title,
     text,
-    lastModified: now,
+    lastModified: new Date().toISOString(),
     transcriptFileName,
+    inputHash,
+    model: resolvedModel,
+    options,
+    preprocessStats: statsLine,
   };
 
   ensureRecordingsDir();

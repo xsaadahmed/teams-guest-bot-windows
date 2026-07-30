@@ -44,7 +44,7 @@ def load_speaker_intervals(captions_path):
     intervals = []
     for entry in data.get("captions", []):
         start_s = entry.get("tStartMs", 0) / 1000.0
-        end_s = entry.get("tEndMs", start_s * 1000) / 1000.0
+        end_s = entry.get("tEndMs", entry.get("tStartMs", 0)) / 1000.0
         # Teams marks a caption line at a single instant for short utterances; give it a small
         # minimum duration so it can still overlap a Whisper segment.
         if end_s - start_s < 1.5:

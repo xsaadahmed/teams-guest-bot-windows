@@ -434,8 +434,9 @@ app.get('/summaries/:id', (req: Request, res: Response) => {
 
 /**
  * Manually generate a summary for a transcript.
- * Body: { "transcriptFileName": "....transcript.txt", "model"?: string }
- * Idempotent if a summary already exists for that transcript.
+ * Body: { "transcriptFileName": "....transcript.txt", "model"?: string, "force"?: boolean }
+ * Cached by content hash: regenerates when the preprocessed transcript or model changes.
+ * Pass force:true to regenerate regardless.
  */
 app.post('/summaries', async (req: Request, res: Response) => {
   const transcriptFileName = req.body?.transcriptFileName;
@@ -444,8 +445,9 @@ app.post('/summaries', async (req: Request, res: Response) => {
   }
   const model =
     typeof req.body?.model === 'string' && req.body.model.trim() ? req.body.model.trim() : undefined;
+  const force = req.body?.force === true || req.body?.force === 'true';
   try {
-    const summary = await generateSummaryForTranscript(transcriptFileName.trim(), model);
+    const summary = await generateSummaryForTranscript(transcriptFileName.trim(), model, force);
     res.status(201).json(summary);
   } catch (err) {
     const message = (err as Error).message || 'Summary generation failed.';
