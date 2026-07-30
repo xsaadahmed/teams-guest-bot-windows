@@ -61,7 +61,7 @@ export class CaptionTracker {
         const existing = this.entries.get(ev.id);
         if (existing) {
           existing.text = ev.text;
-          existing.speaker = ev.speaker || existing.speaker;
+          if (ev.speaker && ev.speaker !== 'Unknown') existing.speaker = ev.speaker;
           existing.tEndMs = ev.tMs;
         } else {
           this.entries.set(ev.id, {
