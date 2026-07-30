@@ -34,7 +34,6 @@ function markSpawnBlocked(err: Error): void {
  */
 export function applyUiWindowLayout(layout: UiWindowLayout): void {
   if (process.platform !== 'win32') return;
-  // After a spawn EPERM, skip further attempts (corporate policy) — UI uses in-page overlay.
   if (spawnBlocked) return;
 
   const left = Number.isFinite(layout.left) ? Math.round(layout.left as number) : 8;

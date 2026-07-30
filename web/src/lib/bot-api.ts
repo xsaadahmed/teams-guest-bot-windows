@@ -61,20 +61,67 @@ export function getBotStatus(): Promise<BotStatus> {
   return api<BotStatus>("/status");
 }
 
+export interface LlmConfigStatus {
+  configured: boolean;
+  gatewayUrl: string;
+  model: string;
+  apiKeySet: boolean;
+  apiKeyPreview: string | null;
+  fromEnv: {
+    apiKey: boolean;
+    gatewayUrl: boolean;
+    model: boolean;
+  };
+  /** Settings override .env when LLM_ALLOW_UI_OVERRIDE is enabled. */
+  uiOverride: boolean;
+}
+
 export interface BotConfig {
   localParticipantName: string;
   botDisplayName: string;
+  llm: LlmConfigStatus;
+}
+
+export interface SaveBotConfigInput {
+  localParticipantName?: string;
+  llmGatewayUrl?: string;
+  llmApiKey?: string;
+  llmModel?: string;
 }
 
 export function getBotConfig(): Promise<BotConfig> {
   return api<BotConfig>("/config");
 }
 
-export function saveBotConfig(localParticipantName: string): Promise<BotConfig> {
+export function saveBotConfig(input: SaveBotConfigInput): Promise<BotConfig> {
   return api<BotConfig>("/config", {
     method: "PUT",
-    body: JSON.stringify({ localParticipantName }),
+    body: JSON.stringify(input),
   });
+}
+
+export async function testLlmConnection(model?: string): Promise<{
+  ok: boolean;
+  gatewayUrl: string;
+  model: string;
+  error?: string;
+}> {
+  const res = await fetch("/config/llm/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(model ? { model } : {}),
+  });
+  const text = await res.text();
+  let data: { ok: boolean; gatewayUrl: string; model: string; error?: string };
+  try {
+    data = text ? JSON.parse(text) : { ok: false, gatewayUrl: "", model: "", error: res.statusText };
+  } catch {
+    throw new Error(text || res.statusText);
+  }
+  if (!res.ok && !data.error) {
+    data.error = res.statusText;
+  }
+  return data;
 }
 
 export function joinMeeting(

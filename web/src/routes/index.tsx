@@ -7,6 +7,7 @@ import {
   X,
   Minus,
   ChevronUp,
+  Settings,
   Info,
   CheckCircle2,
   Home,
@@ -40,6 +41,7 @@ import {
   recordingDownloadUrl,
   recordingPlayUrl,
   saveBotConfig,
+  testLlmConnection,
   uploadTranscript,
   type RecordingItem,
   type SummaryItem,
@@ -109,7 +111,7 @@ export const Route = createFileRoute("/")({
   component: Index,
 });
 
-type Page = "home" | "recording" | "notes" | "recordings" | "summaries" | "info";
+type Page = "home" | "recording" | "notes" | "recordings" | "summaries" | "settings";
 
 // Outer window size must fit Edge title bar + app chrome + recorder controls (tight).
 const OVERLAY_EXPANDED = { width: 280, height: 188 };
@@ -142,12 +144,6 @@ function normalizeMainGeometry(g: WindowGeometry | null): WindowGeometry {
   return g;
 }
 
-/**
- * null = not probed yet, true = Edge/OS accepts resize or Win32 layout,
- * false = corp/locked browser — use in-page floating card only (no PowerShell spam).
- */
-let osWindowLayoutCapable: boolean | null = null;
-
 function overlayTargetRect(collapsed: boolean) {
   const size = collapsed ? OVERLAY_COLLAPSED : OVERLAY_EXPANDED;
   const availLeft = window.screen.availLeft ?? 0;
@@ -158,78 +154,63 @@ function overlayTargetRect(collapsed: boolean) {
   return { ...size, left, top };
 }
 
-function windowMatchesSize(size: { width: number; height: number }, slack = 72): boolean {
+function applyBrowserMiniWindowGeometry(collapsed: boolean): void {
+  const { width, height, left, top } = overlayTargetRect(collapsed);
+  try {
+    window.resizeTo(width, height);
+    window.moveTo(left, top);
+  } catch {
+    // Some corporate browsers block resizeTo on the main app window.
+  }
+}
+
+function windowMatchesMiniSize(collapsed: boolean, slack = 48): boolean {
+  const size = collapsed ? OVERLAY_COLLAPSED : OVERLAY_EXPANDED;
   return (
     Math.abs(window.outerWidth - size.width) <= slack &&
-    Math.abs(window.outerHeight - size.height) <= slack + 32
+    Math.abs(window.outerHeight - size.height) <= slack + 28
   );
 }
 
-function tryBrowserWindowLayout(size: { width: number; height: number }, left: number, top: number): boolean {
-  try {
-    window.resizeTo(size.width, size.height);
-    window.moveTo(left, top);
-  } catch {
-    return false;
-  }
-  return windowMatchesSize(size);
+/** Keep the mini recorder at one fixed size (non-resizable) while recording. */
+function startMiniWindowSizeLock(getCollapsed: () => boolean): () => void {
+  const apply = () => {
+    if (!windowMatchesMiniSize(getCollapsed())) {
+      placeOverlayWindow(getCollapsed());
+    }
+  };
+  apply();
+  const onResize = () => apply();
+  window.addEventListener("resize", onResize);
+  const id = window.setInterval(apply, 250);
+  return () => {
+    window.removeEventListener("resize", onResize);
+    window.clearInterval(id);
+  };
 }
 
-/** Clear always-on-top and restore a normal main-window geometry (fixes Alt+Tab lock). */
-function clearTopmostLayout(geometry?: WindowGeometry | null): void {
-  const g = normalizeMainGeometry(geometry ?? captureWindowGeometry());
+/** Snap this window to the fixed mini recorder size (browser + Win32). */
+function placeOverlayWindow(collapsed: boolean): void {
+  const { width, height, left, top } = overlayTargetRect(collapsed);
+  applyBrowserMiniWindowGeometry(collapsed);
+  void positionUiWindow({ width, height, left, top, topmost: true }).catch(() => undefined);
+}
+
+function restoreMainWindow(g: WindowGeometry | null): void {
+  const geo = normalizeMainGeometry(g ?? captureWindowGeometry());
   try {
-    window.resizeTo(g.width, g.height);
-    window.moveTo(g.x, g.y);
+    window.resizeTo(geo.width, geo.height);
+    window.moveTo(geo.x, geo.y);
   } catch {
     // ignore
   }
-  // Always attempt — even if we previously thought layout was blocked. A stuck HWND_TOPMOST
-  // is worse than a harmless EPERM warning.
   void positionUiWindow({
-    width: g.width,
-    height: g.height,
-    left: g.x,
-    top: g.y,
+    width: geo.width,
+    height: geo.height,
+    left: geo.x,
+    top: geo.y,
     topmost: false,
   }).catch(() => undefined);
-}
-
-/**
- * Prefer shrinking the Edge --app window (home). Returns:
- * - "os" when the outer window is confirmed small
- * - "pending" while Win32/browser resize is still being tried
- * - "inpage" only after probes failed (corporate fallback)
- *
- * Never sets HWND_TOPMOST until the window size is confirmed — otherwise a failed
- * resize leaves a full-size always-on-top window that traps Alt+Tab.
- */
-function placeOverlayWindow(collapsed: boolean): "os" | "pending" | "inpage" {
-  const { width, height, left, top } = overlayTargetRect(collapsed);
-  const size = { width, height };
-
-  if (osWindowLayoutCapable === false) {
-    return "inpage";
-  }
-
-  if (tryBrowserWindowLayout(size, left, top) || windowMatchesSize(size)) {
-    osWindowLayoutCapable = true;
-    void positionUiWindow({ ...size, left, top, topmost: true }).catch(() => undefined);
-    return "os";
-  }
-
-  // Ask Win32 to resize WITHOUT topmost first. Only pin topmost after size confirms.
-  if (osWindowLayoutCapable !== false) {
-    void positionUiWindow({ ...size, left, top, topmost: false }).catch(() => {
-      // Don't permanently disable here — transient spawn failures happen; finalize decides.
-    });
-  }
-
-  return "pending";
-}
-
-function restoreMainWindow(g: WindowGeometry | null) {
-  clearTopmostLayout(g);
 }
 
 function exitOverlayMode(
@@ -255,8 +236,6 @@ function Index() {
   const [summaryFocusId, setSummaryFocusId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<string>("auto");
   const [overlayOnly, setOverlayOnly] = useState(false);
-  /** When OS can't shrink Edge (corp), keep the mini recorder as an in-page floating card. */
-  const [inPageOverlay, setInPageOverlay] = useState(false);
   const [theme, setTheme] = useState<Theme>(() =>
     typeof document !== "undefined" ? resolveTheme() : "light",
   );
@@ -292,7 +271,7 @@ function Index() {
     }
     setNameSaving(true);
     try {
-      await saveBotConfig(trimmed);
+      await saveBotConfig({ localParticipantName: trimmed });
       setNamePromptOpen(false);
       toast.success(`Saved as "${trimmed}"`);
     } catch (e) {
@@ -302,11 +281,7 @@ function Index() {
     }
   };
 
-  // On first load of the full UI, clear always-on-top (leftover from a previous stuck session).
-  useEffect(() => {
-    clearTopmostLayout(captureWindowGeometry());
-  }, []);
-
+  // Shrink to fixed mini size shortly after join (same single window as before).
   useEffect(() => {
     if (recorder.mode !== "recording" || !pendingOverlay.current) return;
 
@@ -316,70 +291,17 @@ function Index() {
         savedGeometry.current = captureWindowGeometry();
       }
       miniCollapsedRef.current = false;
-      // Re-probe each meeting — don't permanently lock home machines into in-page mode
-      // after one flaky Edge resizeTo attempt.
-      osWindowLayoutCapable = null;
-      setInPageOverlay(false);
       setOverlayOnly(true);
+      placeOverlayWindow(false);
     }, 1500);
 
     return () => window.clearTimeout(t);
   }, [recorder.mode]);
 
-  // Probe OS resize; prefer real floating mini window. Fall back to in-page card only after
-  // retries fail — and always clear topmost when falling back (prevents Alt+Tab lock).
+  // Keep window pinned to mini dimensions while recording (user cannot resize away).
   useEffect(() => {
     if (!overlayOnly) return;
-
-    let cancelled = false;
-    let decided = false;
-
-    const commitOs = () => {
-      if (cancelled || decided) return;
-      decided = true;
-      osWindowLayoutCapable = true;
-      setInPageOverlay(false);
-      const { width, height, left, top } = overlayTargetRect(miniCollapsedRef.current);
-      void positionUiWindow({ width, height, left, top, topmost: true }).catch(() => undefined);
-    };
-
-    const commitInPage = () => {
-      if (cancelled || decided) return;
-      decided = true;
-      osWindowLayoutCapable = false;
-      setInPageOverlay(true);
-      // Critical: clear any HWND_TOPMOST from probe attempts so Alt+Tab works again.
-      clearTopmostLayout(savedGeometry.current);
-    };
-
-    const probe = () => {
-      if (cancelled || decided) return;
-      const mode = placeOverlayWindow(miniCollapsedRef.current);
-      if (mode === "os") {
-        commitOs();
-      }
-    };
-
-    probe();
-    const delays = [100, 250, 500, 900, 1500, 2200];
-    const timers = delays.map((ms) => window.setTimeout(probe, ms));
-
-    // After probes, lock decision. Prefer OS if size matches; otherwise in-page.
-    const finalize = window.setTimeout(() => {
-      if (cancelled || decided) return;
-      const size = miniCollapsedRef.current ? OVERLAY_COLLAPSED : OVERLAY_EXPANDED;
-      if (windowMatchesSize(size)) {
-        commitOs();
-      } else {
-        commitInPage();
-      }
-    }, 2800);
-
-    return () => {
-      cancelled = true;
-      timers.forEach((id) => window.clearTimeout(id));
-      window.clearTimeout(finalize);
-    };
+    return startMiniWindowSizeLock(() => miniCollapsedRef.current);
   }, [overlayOnly]);
 
   useEffect(() => {
@@ -388,11 +310,8 @@ function Index() {
 
     const g = savedGeometry.current;
     savedGeometry.current = null;
-    // Always clear topmost on leave — even if we used in-page fallback mid-session.
-    clearTopmostLayout(g);
     return exitOverlayMode(g, () => {
       setOverlayOnly(false);
-      setInPageOverlay(false);
     });
   }, [recorder.mode, overlayOnly]);
 
@@ -416,28 +335,16 @@ function Index() {
     </RecorderContext.Provider>
   );
 
-  if (overlayOnly && !inPageOverlay) {
+  if (overlayOnly) {
     return shell(
-      <div
-        className={cn(
-          "h-full w-full overflow-hidden",
-          // In-page fallback: leave a quiet canvas so the fixed mini card reads as floating.
-          inPageOverlay ? "bg-transparent" : "bg-background",
-        )}
-      >
+      <div className="h-full w-full overflow-hidden bg-background">
         <MeetingAssistantWindow
           forceVisible
           highest
-          preferInPage={inPageOverlay}
+          miniWindow
           onChromeCollapseChange={(miniCollapsed) => {
             miniCollapsedRef.current = miniCollapsed;
-            const mode = placeOverlayWindow(miniCollapsed);
-            if (mode === "os") {
-              setInPageOverlay(false);
-            } else if (mode === "inpage") {
-              setInPageOverlay(true);
-              clearTopmostLayout(savedGeometry.current);
-            }
+            placeOverlayWindow(miniCollapsed);
           }}
         />
       </div>,
@@ -509,38 +416,21 @@ function Index() {
               onSelectedModelChange={setSelectedModel}
             />
           )}
-          {page === "info" && <AboutPage />}
+          {page === "settings" && <SettingsPage />}
         </SidebarInset>
-        <DockedMeetingAssistant
-          chromeCollapsed={page === "recording"}
-          forceVisible={inPageOverlay && recorder.mode === "recording"}
-          preferInPage={inPageOverlay}
-        />
+        <DockedMeetingAssistant chromeCollapsed={page === "recording"} />
       </SidebarProvider>
     </>,
   );
 }
 
-/** Floats the mini recorder just to the right of the sidebar so it never covers Dark mode / About. */
-function DockedMeetingAssistant({
-  chromeCollapsed,
-  forceVisible = false,
-  preferInPage = false,
-}: {
-  chromeCollapsed: boolean;
-  forceVisible?: boolean;
-  preferInPage?: boolean;
-}) {
+/** Floats the mini recorder just to the right of the sidebar so it never covers Dark mode / Settings. */
+function DockedMeetingAssistant({ chromeCollapsed }: { chromeCollapsed: boolean }) {
   const { state } = useSidebar();
   // Explicit rem values (match SIDEBAR_WIDTH / SIDEBAR_WIDTH_ICON) — more reliable than CSS vars on fixed elements.
   const leftClass = state === "expanded" ? "left-[12.75rem]" : "left-[3.75rem]";
   return (
-    <MeetingAssistantWindow
-      chromeCollapsed={chromeCollapsed}
-      dockClassName={leftClass}
-      forceVisible={forceVisible}
-      preferInPage={preferInPage}
-    />
+    <MeetingAssistantWindow chromeCollapsed={chromeCollapsed} dockClassName={leftClass} />
   );
 }
 
@@ -639,19 +529,19 @@ function AppSidebar({
           </SidebarMenuItem>
           <SidebarMenuItem className="relative">
             <SidebarMenuButton
-              isActive={page === "info"}
-              tooltip="About"
-              onClick={() => setPage("info")}
+              isActive={page === "settings"}
+              tooltip="Settings"
+              onClick={() => setPage("settings")}
               className={
-                page === "info"
+                page === "settings"
                   ? "bg-sidebar-accent font-semibold shadow-sm ring-1 ring-sidebar-border"
                   : undefined
               }
             >
-              <Info />
-              <span>About</span>
+              <Settings />
+              <span>Settings</span>
             </SidebarMenuButton>
-            {page === "info" && (
+            {page === "settings" && (
               <span
                 aria-hidden
                 className="pointer-events-none absolute left-0 top-1.5 bottom-1.5 w-1 rounded-r-full bg-foreground"
@@ -682,7 +572,7 @@ const BROWSE_CARD_ACCENT = "text-muted-foreground bg-secondary";
 const BROWSE_CARD_CLASS =
   "border-border/80 bg-secondary/30 hover:border-border hover:bg-secondary/40 hover:shadow-sm";
 
-/** Narrow/form pages (Record, About) — fill the inset and center the panel. */
+/** Narrow/form pages (Record, Settings) — fill the inset and center the panel. */
 function PageFormCenter({ children }: { children: ReactNode }) {
   return (
     <div className="flex flex-1 min-h-0 w-full items-center justify-center px-6 py-8">
@@ -1156,6 +1046,8 @@ function SummariesPage({
         }
       />
 
+      <LlmSetupBanner setPage={setPage} />
+
       {error && (
         <Alert variant="destructive" className="mb-4">
           <AlertCircle className="h-4 w-4" />
@@ -1299,13 +1191,263 @@ function RecordingPage() {
   );
 }
 
-function AboutPage() {
+function LlmSetupBanner({ setPage }: { setPage: (p: Page) => void }) {
+  const [configured, setConfigured] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    getBotConfig()
+      .then((cfg) => setConfigured(cfg.llm.configured))
+      .catch(() => setConfigured(null));
+  }, []);
+
+  if (configured !== false) return null;
+
+  return (
+    <Alert className="mb-4">
+      <Sparkles className="h-4 w-4" />
+      <AlertTitle>AI summarization not configured</AlertTitle>
+      <AlertDescription>
+        Add your API key in{" "}
+        <button
+          type="button"
+          className="font-medium underline underline-offset-2 hover:text-foreground"
+          onClick={() => setPage("settings")}
+        >
+          Settings
+        </button>{" "}
+        to generate summaries.
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+function SettingsPage() {
+  const [loading, setLoading] = useState(true);
+  const [gatewayUrl, setGatewayUrl] = useState("");
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [model, setModel] = useState("");
+  const [apiKeySet, setApiKeySet] = useState(false);
+  const [apiKeyPreview, setApiKeyPreview] = useState<string | null>(null);
+  const [fromEnv, setFromEnv] = useState({ apiKey: false, gatewayUrl: false, model: false });
+  const [uiOverride, setUiOverride] = useState(false);
+  const [configured, setConfigured] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  const loadConfig = () => {
+    setLoading(true);
+    return getBotConfig()
+      .then((cfg) => {
+        setGatewayUrl(cfg.llm.gatewayUrl);
+        setModel(cfg.llm.model);
+        setApiKeySet(cfg.llm.apiKeySet);
+        setApiKeyPreview(cfg.llm.apiKeyPreview);
+        setFromEnv(cfg.llm.fromEnv);
+        setUiOverride(cfg.llm.uiOverride);
+        setConfigured(cfg.llm.configured);
+        setApiKeyDraft("");
+      })
+      .catch((e) => toast.error((e as Error).message))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    void loadConfig();
+  }, []);
+
+  const handleSave = async () => {
+    const payload: {
+      llmGatewayUrl?: string;
+      llmApiKey?: string;
+      llmModel?: string;
+    } = {};
+
+    const canEditGateway = uiOverride || !fromEnv.gatewayUrl;
+    const canEditModel = uiOverride || !fromEnv.model;
+    const canEditApiKey = uiOverride || !fromEnv.apiKey;
+
+    if (canEditGateway) payload.llmGatewayUrl = gatewayUrl.trim();
+    if (canEditModel) payload.llmModel = model.trim();
+    if (canEditApiKey && apiKeyDraft.trim()) payload.llmApiKey = apiKeyDraft.trim();
+
+    if (canEditGateway && !payload.llmGatewayUrl) {
+      toast.error("Gateway URL is required.");
+      return;
+    }
+    if (canEditApiKey && !apiKeySet && !payload.llmApiKey) {
+      toast.error("API key is required.");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const cfg = await saveBotConfig(payload);
+      setGatewayUrl(cfg.llm.gatewayUrl);
+      setModel(cfg.llm.model);
+      setApiKeySet(cfg.llm.apiKeySet);
+      setApiKeyPreview(cfg.llm.apiKeyPreview);
+      setFromEnv(cfg.llm.fromEnv);
+      setUiOverride(cfg.llm.uiOverride);
+      setConfigured(cfg.llm.configured);
+      setApiKeyDraft("");
+      toast.success("Settings saved");
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    try {
+      const result = await testLlmConnection(model.trim() || undefined);
+      if (result.ok) {
+        toast.success(`Connected (${result.model})`);
+      } else {
+        toast.error(result.error || "Connection test failed");
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const envLocked =
+    !uiOverride && (fromEnv.apiKey || fromEnv.gatewayUrl || fromEnv.model);
+  const fieldLocked = (fromEnvKey: boolean) => !uiOverride && fromEnvKey;
+
   return (
     <PageFormCenter>
-      <div className="w-full max-w-lg">
-        <h1 className="text-2xl font-semibold">About</h1>
-        <p className="text-sm text-muted-foreground mt-1">e&amp; Meeting Assistant — Teams guest bot</p>
-        <Card className="mt-6">
+      <div className="w-full max-w-lg space-y-6">
+        <div>
+          <h1 className="text-2xl font-semibold">Settings</h1>
+          <p className="text-sm text-muted-foreground mt-1">e&amp; Meeting Assistant — Teams guest bot</p>
+        </div>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">AI Summarization</CardTitle>
+            <CardDescription>
+              Connect an OpenAI-compatible API to generate meeting summaries from transcripts.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {loading ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Loading…
+              </div>
+            ) : (
+              <>
+                {uiOverride && (
+                  <Alert>
+                    <Info className="h-4 w-4" />
+                    <AlertDescription>
+                      <code className="text-xs bg-muted px-1 rounded">LLM_ALLOW_UI_OVERRIDE</code>{" "}
+                      is on — values saved here override your <code className="text-xs bg-muted px-1 rounded">.env</code>{" "}
+                      file.
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {envLocked && (
+                  <Alert>
+                    <Info className="h-4 w-4" />
+                    <AlertDescription>
+                      Some LLM settings are managed by environment variables (.env) and cannot be
+                      changed here. Set{" "}
+                      <code className="text-xs bg-muted px-1 rounded">LLM_ALLOW_UI_OVERRIDE=true</code>{" "}
+                      in <code className="text-xs bg-muted px-1 rounded">.env</code> to test overrides
+                      from Settings.
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                <div className="flex items-center gap-2">
+                  <Badge variant={configured ? "default" : "secondary"}>
+                    {configured ? "Configured" : "Not configured"}
+                  </Badge>
+                  {apiKeySet && apiKeyPreview ? (
+                    <span className="text-xs text-muted-foreground">Key {apiKeyPreview}</span>
+                  ) : null}
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="llm-gateway">Gateway URL</Label>
+                  <Input
+                    id="llm-gateway"
+                    type="url"
+                    placeholder="https://api.x.ai/v1"
+                    value={gatewayUrl}
+                    onChange={(e) => setGatewayUrl(e.target.value)}
+                    disabled={fieldLocked(fromEnv.gatewayUrl)}
+                    autoComplete="off"
+                  />
+                  {fieldLocked(fromEnv.gatewayUrl) ? (
+                    <p className="text-xs text-muted-foreground">Set via LLM_GATEWAY_URL</p>
+                  ) : null}
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="llm-api-key">API key</Label>
+                  <Input
+                    id="llm-api-key"
+                    type="password"
+                    placeholder={apiKeySet ? "Enter a new key to replace the saved one" : "sk-…"}
+                    value={apiKeyDraft}
+                    onChange={(e) => setApiKeyDraft(e.target.value)}
+                    disabled={fieldLocked(fromEnv.apiKey)}
+                    autoComplete="off"
+                  />
+                  {fieldLocked(fromEnv.apiKey) ? (
+                    <p className="text-xs text-muted-foreground">Set via LLM_API_KEY</p>
+                  ) : apiKeySet ? (
+                    <p className="text-xs text-muted-foreground">
+                      Leave blank to keep the current key ({apiKeyPreview})
+                    </p>
+                  ) : null}
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="llm-model">Default model</Label>
+                  <Input
+                    id="llm-model"
+                    placeholder="grok-2-latest"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    disabled={fieldLocked(fromEnv.model)}
+                    autoComplete="off"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Used when the model picker is set to Auto on the Summaries page.
+                  </p>
+                  {fieldLocked(fromEnv.model) ? (
+                    <p className="text-xs text-muted-foreground">Set via LLM_MODEL</p>
+                  ) : null}
+                </div>
+
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <Button onClick={() => void handleSave()} disabled={saving || loading}>
+                    {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    Save
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={() => void handleTest()}
+                    disabled={testing || loading || !configured}
+                  >
+                    {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    Test connection
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
           <CardContent className="pt-6 space-y-3 text-sm">
             <p>
               Joins Microsoft Teams meetings as a guest, records audio, and captures live captions into
@@ -1531,6 +1673,8 @@ function NotesPage({
           </div>
         }
       />
+
+      <LlmSetupBanner setPage={setPage} />
 
       {error && (
         <Alert variant="destructive" className="mb-4">
@@ -2434,29 +2578,21 @@ function RecorderPanel({ size = "mini", overlay = false }: { size?: "mini" | "la
 function MeetingAssistantWindow({
   forceVisible = false,
   highest = false,
-  preferInPage = false,
+  miniWindow = false,
   chromeCollapsed,
   dockClassName,
   onChromeCollapseChange,
 }: {
   forceVisible?: boolean;
   highest?: boolean;
-  /**
-   * When true, always use the in-page fixed mini card (corporate Edge can't resize
-   * the outer window). Ignores osSized / fill-window mode.
-   */
-  preferInPage?: boolean;
-  /** When true, show only the title bar (used on Record page so the large panel is the focus). */
+  /** Dedicated mini popup (?mini=1) or same-window compact mode — fixed size, non-resizable. */
+  miniWindow?: boolean;
   chromeCollapsed?: boolean;
-  /** Overrides default bottom-left docking (e.g. clear of the sidebar). */
   dockClassName?: string;
   onChromeCollapseChange?: (collapsed: boolean) => void;
 }) {
   const [closed, setClosed] = useState(false);
   const [minimized, setMinimized] = useState(Boolean(chromeCollapsed));
-  // Only fill the Edge window when OS resize actually made it overlay-sized.
-  // Otherwise keep a compact card so we don't stretch the mini UI across a full window.
-  const [osSized, setOsSized] = useState(false);
 
   const minimizedRef = useRef(minimized);
   minimizedRef.current = minimized;
@@ -2487,25 +2623,6 @@ function MeetingAssistantWindow({
     pageForcedRef.current = forced;
   }, [chromeCollapsed, forceVisible, highest]);
 
-  useEffect(() => {
-    if (!highest || preferInPage) {
-      setOsSized(false);
-      return;
-    }
-    const check = () => {
-      const maxW = OVERLAY_EXPANDED.width + 48;
-      const maxH = OVERLAY_EXPANDED.height + 64;
-      setOsSized(window.outerWidth <= maxW && window.outerHeight <= maxH);
-    };
-    check();
-    const id = window.setInterval(check, 250);
-    window.addEventListener("resize", check);
-    return () => {
-      window.clearInterval(id);
-      window.removeEventListener("resize", check);
-    };
-  }, [highest, preferInPage]);
-
   const collapseCb = useRef(onChromeCollapseChange);
   collapseCb.current = onChromeCollapseChange;
   useEffect(() => {
@@ -2525,16 +2642,15 @@ function MeetingAssistantWindow({
 
   if (closed && !forceVisible) return null;
 
-  // Corp / locked Edge: preferInPage forces the floating card (DevTools Option A).
-  const fillWindow = highest && osSized && !preferInPage;
+  const fillWindow = miniWindow || highest;
 
   return (
     <Card
       className={cn(
         "overflow-hidden gap-0 py-0",
         fillWindow
-          ? "fixed inset-0 z-[9999] flex h-full w-full flex-col rounded-none border-0 shadow-none"
-          : cn("fixed bottom-4 z-50 w-[260px] shadow-2xl", dockClassName ?? "left-4"),
+          ? "flex h-full w-full flex-col rounded-none border-0 shadow-none"
+          : cn("fixed bottom-4 z-50 w-[280px] shadow-2xl", dockClassName ?? "left-4"),
       )}
     >
       <div className="flex shrink-0 items-center justify-between px-3 py-1.5 bg-foreground text-background text-xs">

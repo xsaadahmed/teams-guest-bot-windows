@@ -27,6 +27,7 @@ import { autoTranscribeInBackground } from './autoTranscribe';
 import { RosterMuteTracker } from './rosterMuteTracker';
 import { getLocalParticipantName } from './userConfig';
 import { renameRecordingArtifacts } from './recordingFileName';
+import { trimWavKeepHeadMs } from './wavTrim';
 
 export type BotState = 'idle' | 'joining' | 'in_meeting' | 'leaving' | 'error';
 
@@ -95,6 +96,13 @@ export class TeamsGuestBot {
   private localMicOpen = true;
   /** Wall-clock when the bot first appeared alone; null when not alone. */
   private aloneSinceMs: number | null = null;
+  /** Epoch ms when the WAV recorder started (aligns with caption timestamps). */
+  private recordingStartEpochMs: number | null = null;
+  /**
+   * When auto-leaving after 15s alone: ms from recording start to discard (alone countdown start).
+   * Cleared if someone rejoins before leave. Not set for manual stop or meeting-ended leave.
+   */
+  private pendingAloneTrimFromRecordingMs: number | null = null;
   /** Names seen on the roster at any point during this meeting (union of scrapes). */
   private seenParticipants = new Set<string>();
 
@@ -126,6 +134,8 @@ export class TeamsGuestBot {
     this.recordingPaused = false;
     this.localMicOpen = true;
     this.aloneSinceMs = null;
+    this.recordingStartEpochMs = null;
+    this.pendingAloneTrimFromRecordingMs = null;
     this.seenParticipants.clear();
     this.stopParticipantAccumulator();
     this.status = { state: 'joining', meetingUrl: req.meetingUrl, displayName };
@@ -161,9 +171,10 @@ export class TeamsGuestBot {
       const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
       const filePath = path.join(RECORDINGS_DIR, fileName);
       this.recordingFilePath = filePath;
+      this.recordingStartEpochMs = Date.now();
       this.recorder.start(filePath);
 
-      const recordingStartEpoch = Date.now();
+      const recordingStartEpoch = this.recordingStartEpochMs;
       this.captionsActive = false;
 
       // Refresh dismiss polling for any late post-join prompts.
@@ -300,6 +311,20 @@ export class TeamsGuestBot {
 
       await this.recorder.stop();
 
+      const aloneTrimMs = this.pendingAloneTrimFromRecordingMs;
+      if (aloneTrimMs != null && this.recordingFilePath) {
+        try {
+          if (trimWavKeepHeadMs(this.recordingFilePath, aloneTrimMs)) {
+            console.log(
+              `[bot] Trimmed alone-wait tail from recording (kept first ${(aloneTrimMs / 1000).toFixed(1)}s)`,
+            );
+          }
+        } catch (err) {
+          console.warn('[bot] Could not trim alone-wait audio from recording:', err);
+        }
+      }
+      this.pendingAloneTrimFromRecordingMs = null;
+
       if (this.recordingFilePath && meetingTitle) {
         try {
           const renamed = renameRecordingArtifacts(this.recordingFilePath, meetingTitle, RECORDINGS_DIR);
@@ -342,7 +367,17 @@ export class TeamsGuestBot {
   private async finalizeTranscript(): Promise<void> {
     if (!this.captionsActive || !this.recordingFilePath) return;
 
-    const entries = await this.captions.stop();
+    let entries = await this.captions.stop();
+    const aloneTrimMs = this.pendingAloneTrimFromRecordingMs;
+    if (aloneTrimMs != null) {
+      const before = entries.length;
+      entries = entries.filter((e) => e.tStartMs < aloneTrimMs);
+      if (before > entries.length) {
+        console.log(
+          `[bot] Dropped ${before - entries.length} caption line(s) from alone-wait tail`,
+        );
+      }
+    }
     // Final scrape + merge so anyone still present is included with everyone seen earlier.
     if (this.page) {
       try {
@@ -444,6 +479,12 @@ export class TeamsGuestBot {
         console.log(`[bot] Bot alone in meeting (${Math.round(elapsed / 1000)}s / 15s)`);
         if (elapsed >= ALONE_LEAVE_MS) {
           console.log('[bot] Bot has been alone for 15s - leaving meeting');
+          if (this.aloneSinceMs != null && this.recordingStartEpochMs != null) {
+            this.pendingAloneTrimFromRecordingMs = Math.max(
+              0,
+              this.aloneSinceMs - this.recordingStartEpochMs,
+            );
+          }
           this.stopEndOfMeetingWatcher();
           await this.leave().catch((err) => console.error('[bot] error during alone-leave:', err));
         }

@@ -4,14 +4,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { TeamsGuestBot } from './bot';
 import { applyUiWindowLayout } from './uiWindow';
-import { bootstrapUserConfig, getLocalParticipantName, saveUserConfig } from './userConfig';
+import { bootstrapUserConfig, getLocalParticipantName, getEffectiveLlmConfig, isLlmConfigured, maskApiKey, saveUserConfig } from './userConfig';
 import {
   findSummaryByTranscript,
   generateSummaryForTranscript,
   getSummaryById,
   listSummaries,
 } from './summaries';
-import { listAvailableModels } from './llmClient';
+import { checkLLMConnection, listAvailableModels, resetLlmClient } from './llmClient';
 import { isRosterAutomationEnabled } from './teamsJoin';
 
 bootstrapUserConfig();
@@ -81,25 +81,89 @@ app.get('/status', (_req: Request, res: Response) => {
   res.json(bot.getStatus());
 });
 
-/** Local user settings (Teams display name for mute gating). */
-app.get('/config', (_req: Request, res: Response) => {
-  res.json({
+/** Local user settings (Teams display name, LLM for summarization). */
+function buildConfigResponse() {
+  const llm = getEffectiveLlmConfig();
+  return {
     localParticipantName: getLocalParticipantName(),
     botDisplayName: process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant',
-  });
+    llm: {
+      configured: isLlmConfigured(),
+      gatewayUrl: llm.gatewayUrl,
+      model: llm.model,
+      apiKeySet: Boolean(llm.apiKey),
+      apiKeyPreview: maskApiKey(llm.apiKey),
+      fromEnv: llm.fromEnv,
+      uiOverride: llm.uiOverride,
+    },
+  };
+}
+
+app.get('/config', (_req: Request, res: Response) => {
+  res.json(buildConfigResponse());
 });
 
 app.put('/config', (req: Request, res: Response) => {
-  const name = req.body?.localParticipantName;
-  if (typeof name !== 'string' || !name.trim()) {
-    return res.status(400).json({ error: 'localParticipantName is required.' });
+  const body = req.body ?? {};
+  const partial: Parameters<typeof saveUserConfig>[0] = {};
+
+  if (body.localParticipantName !== undefined) {
+    if (typeof body.localParticipantName !== 'string' || !body.localParticipantName.trim()) {
+      return res.status(400).json({ error: 'localParticipantName must be a non-empty string.' });
+    }
+    partial.localParticipantName = body.localParticipantName;
   }
-  const cfg = saveUserConfig({ localParticipantName: name });
-  console.log(`[config] Local participant name set to "${cfg.localParticipantName}"`);
-  res.json({
-    localParticipantName: cfg.localParticipantName,
-    botDisplayName: process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant',
-  });
+
+  if (body.llmGatewayUrl !== undefined) {
+    if (typeof body.llmGatewayUrl !== 'string') {
+      return res.status(400).json({ error: 'llmGatewayUrl must be a string.' });
+    }
+    partial.llmGatewayUrl = body.llmGatewayUrl;
+  }
+
+  if (body.llmApiKey !== undefined) {
+    if (typeof body.llmApiKey !== 'string') {
+      return res.status(400).json({ error: 'llmApiKey must be a string.' });
+    }
+    partial.llmApiKey = body.llmApiKey;
+  }
+
+  if (body.llmModel !== undefined) {
+    if (typeof body.llmModel !== 'string') {
+      return res.status(400).json({ error: 'llmModel must be a string.' });
+    }
+    partial.llmModel = body.llmModel;
+  }
+
+  if (Object.keys(partial).length === 0) {
+    return res.status(400).json({ error: 'No settings provided.' });
+  }
+
+  try {
+    const cfg = saveUserConfig(partial);
+    resetLlmClient();
+    if (partial.localParticipantName) {
+      console.log(`[config] Local participant name set to "${cfg.localParticipantName}"`);
+    }
+    if (
+      partial.llmGatewayUrl !== undefined ||
+      partial.llmApiKey !== undefined ||
+      partial.llmModel !== undefined
+    ) {
+      console.log('[config] LLM settings updated');
+    }
+    res.json(buildConfigResponse());
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+/** Test LLM gateway connectivity with the current saved/env configuration. */
+app.post('/config/llm/test', async (req: Request, res: Response) => {
+  const model =
+    typeof req.body?.model === 'string' && req.body.model.trim() ? req.body.model.trim() : undefined;
+  const result = await checkLLMConnection(model);
+  res.status(result.ok ? 200 : 400).json(result);
 });
 
 /**

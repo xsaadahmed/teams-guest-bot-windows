@@ -1,17 +1,14 @@
 import OpenAI from 'openai';
+import { getEffectiveLlmConfig } from './userConfig';
 
 // ---------------------------------------------------------------------------
-// Configuration (env-overridable; defaults suit an internal meeting summarizer)
+// Configuration (env + saved settings; tunables remain env-only)
 // ---------------------------------------------------------------------------
 
 /** Approximate chars-per-token heuristic used only for chunk sizing. */
 const CHARS_PER_TOKEN_ESTIMATE = 4;
 
-const CONFIG = {
-  gatewayUrl: (process.env.LLM_GATEWAY_URL ?? '').trim(),
-  apiKey: (process.env.LLM_API_KEY ?? '').trim(),
-  model: (process.env.LLM_MODEL ?? '').trim(),
-
+const TUNING = {
   /** Max transcript characters sent in one completion request. */
   maxCharsPerRequest: envInt('LLM_MAX_CHARS_PER_REQUEST', 24_000 * CHARS_PER_TOKEN_ESTIMATE),
   /** Overlap between sequential chunks so context isn't lost at boundaries. */
@@ -28,6 +25,9 @@ const CONFIG = {
 } as const;
 
 const SYSTEM_PROMPT = 'Summarize what happened in the meeting and list any action items.';
+
+const SETTINGS_HINT =
+  'Add your API key and gateway URL in Settings (or set LLM_API_KEY and LLM_GATEWAY_URL).';
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -69,18 +69,23 @@ function envFloat(name: string, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-function assertConfig(): void {
+function runtimeCredentials(): { gatewayUrl: string; apiKey: string; model: string } {
+  const eff = getEffectiveLlmConfig();
+  return {
+    gatewayUrl: eff.gatewayUrl,
+    apiKey: eff.apiKey,
+    model: eff.model,
+  };
+}
+
+function assertConfig(creds = runtimeCredentials()): void {
   const missing: string[] = [];
-  if (!CONFIG.gatewayUrl) missing.push('LLM_GATEWAY_URL');
-  if (!CONFIG.apiKey) missing.push('LLM_API_KEY');
-  // Note: MODEL is intentionally NOT required for non-completion operations
-  // like listing available models. Completion calls resolve a model at runtime.
+  if (!creds.gatewayUrl) missing.push('gateway URL');
+  if (!creds.apiKey) missing.push('API key');
   if (missing.length > 0) {
-    throw new LlmConfigError(
-      `LLM is not configured. Set required environment variable(s): ${missing.join(', ')}.`,
-    );
+    throw new LlmConfigError(`LLM is not configured (${missing.join(' and ')} missing). ${SETTINGS_HINT}`);
   }
-  if (CONFIG.chunkOverlapChars >= CONFIG.maxCharsPerRequest) {
+  if (TUNING.chunkOverlapChars >= TUNING.maxCharsPerRequest) {
     throw new LlmConfigError(
       'LLM_CHUNK_OVERLAP_CHARS must be smaller than LLM_MAX_CHARS_PER_REQUEST.',
     );
@@ -90,28 +95,39 @@ function assertConfig(): void {
 function resolveModel(model?: string): string {
   const trimmed = model?.trim();
   if (trimmed) return trimmed;
-  if (CONFIG.model) return CONFIG.model;
+  const { model: defaultModel } = runtimeCredentials();
+  if (defaultModel) return defaultModel;
   throw new LlmConfigError(
-    'LLM_MODEL is not configured. Set LLM_MODEL or pass a model parameter from the UI.',
+    `No default model configured. Set one in Settings (or LLM_MODEL), or pick a model from the dropdown.`,
   );
 }
 
 // ---------------------------------------------------------------------------
-// Client (lazy — so importing this module never throws on missing env)
+// Client (lazy — recreated when credentials change)
 // ---------------------------------------------------------------------------
 
 let client: OpenAI | null = null;
+let clientFingerprint = '';
+
+/** Drop the cached OpenAI client after settings change. */
+export function resetLlmClient(): void {
+  client = null;
+  clientFingerprint = '';
+}
 
 function getClient(): OpenAI {
-  assertConfig();
-  if (!client) {
-    client = new OpenAI({
-      baseURL: CONFIG.gatewayUrl,
-      apiKey: CONFIG.apiKey,
-      timeout: CONFIG.requestTimeoutMs,
-      maxRetries: 0, // we handle retries ourselves for clearer logs/control
-    });
-  }
+  const creds = runtimeCredentials();
+  assertConfig(creds);
+  const fingerprint = `${creds.gatewayUrl}\0${creds.apiKey}`;
+  if (client && clientFingerprint === fingerprint) return client;
+
+  client = new OpenAI({
+    baseURL: creds.gatewayUrl,
+    apiKey: creds.apiKey,
+    timeout: TUNING.requestTimeoutMs,
+    maxRetries: 0,
+  });
+  clientFingerprint = fingerprint;
   return client;
 }
 
@@ -134,7 +150,6 @@ function isRetryable(err: unknown): boolean {
   if (err instanceof OpenAI.RateLimitError) return true;
   if (err instanceof OpenAI.InternalServerError) return true;
   if (err instanceof OpenAI.APIConnectionError) return true;
-  // Some gateways surface timeouts as generic API errors with status.
   if (err instanceof OpenAI.APIError) {
     const status = err.status;
     return status === 408 || status === 429 || (typeof status === 'number' && status >= 500);
@@ -156,7 +171,7 @@ async function callLLM(
   model: string,
 ): Promise<string> {
   const openai = getClient();
-  const { maxAttempts, retryBaseDelayMs, maxTokens, temperature } = CONFIG;
+  const { maxAttempts, retryBaseDelayMs, maxTokens, temperature } = TUNING;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -177,8 +192,6 @@ async function callLLM(
       return text;
     } catch (err) {
       if (err instanceof LlmConfigError) throw err;
-
-      // Empty-response and other non-retryable failures: wrap once and stop.
       if (err instanceof LlmRequestError) throw err;
 
       if (!isRetryable(err) || attempt === maxAttempts) {
@@ -236,13 +249,12 @@ async function mergeChunkSummaries(summaries: string[], model: string): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// Public API — stable for future backend integration
+// Public API
 // ---------------------------------------------------------------------------
 
 /**
  * Summarize a meeting transcript via the configured LLM gateway.
- * Long transcripts are chunked sequentially (not in parallel) to respect
- * shared-gateway concurrency limits, then merged into one summary.
+ * Long transcripts are chunked sequentially, then merged into one summary.
  */
 export async function summarizeTranscript(
   transcript: string,
@@ -259,11 +271,11 @@ export async function summarizeTranscript(
   const prefix = meetingTitle?.trim() ? `Meeting: ${meetingTitle.trim()}\n\n` : '';
   const fullText = prefix + trimmed;
 
-  if (fullText.length <= CONFIG.maxCharsPerRequest) {
+  if (fullText.length <= TUNING.maxCharsPerRequest) {
     return callLLM(`Meeting transcript:\n\n${fullText}`, 'summarize', resolvedModel);
   }
 
-  const chunks = splitIntoChunks(fullText, CONFIG.maxCharsPerRequest, CONFIG.chunkOverlapChars);
+  const chunks = splitIntoChunks(fullText, TUNING.maxCharsPerRequest, TUNING.chunkOverlapChars);
   logInfo(`Transcript length ${fullText.length} chars; summarizing ${chunks.length} chunk(s) sequentially`);
 
   const results: string[] = [];
@@ -283,27 +295,29 @@ export async function listAvailableModels(): Promise<string[]> {
 }
 
 /** Lightweight connectivity check (no secrets in the returned payload). */
-export async function checkLLMConnection(): Promise<{
+export async function checkLLMConnection(model?: string): Promise<{
   ok: boolean;
   gatewayUrl: string;
   model: string;
   error?: string;
 }> {
   try {
-    assertConfig();
+    const creds = runtimeCredentials();
+    assertConfig(creds);
     const openai = getClient();
-    const resolvedModel = resolveModel();
+    const resolvedModel = resolveModel(model);
     await openai.chat.completions.create({
       model: resolvedModel,
       messages: [{ role: 'user', content: 'Reply with the single word: ready' }],
       max_tokens: 10,
     });
-    return { ok: true, gatewayUrl: CONFIG.gatewayUrl, model: resolvedModel };
+    return { ok: true, gatewayUrl: creds.gatewayUrl, model: resolvedModel };
   } catch (err) {
+    const creds = runtimeCredentials();
     return {
       ok: false,
-      gatewayUrl: CONFIG.gatewayUrl || '(not set)',
-      model: CONFIG.model || '(not set)',
+      gatewayUrl: creds.gatewayUrl || '(not set)',
+      model: model?.trim() || creds.model || '(not set)',
       error: errorMessage(err),
     };
   }
