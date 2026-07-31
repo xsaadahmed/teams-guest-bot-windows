@@ -73,7 +73,7 @@ export function renameRecordingArtifacts(
     { from: currentWavPath, to: newWavPath },
     ...RECORDING_SIDEcar_SUFFIXES.map((suffix) => ({
       from: `${oldBase}${suffix}`,
-      to: `${newBase}${suffix}`,
+      to: path.join(dir, `${newBase}${suffix}`),
     })),
   ];
 
@@ -82,7 +82,7 @@ export function renameRecordingArtifacts(
     fs.renameSync(from, to);
   }
 
-  const captionsPath = `${newBase}.captions.json`;
+  const captionsPath = path.join(dir, `${newBase}.captions.json`);
   if (fs.existsSync(captionsPath)) {
     try {
       const data = JSON.parse(fs.readFileSync(captionsPath, 'utf8')) as { recordingFile?: string };

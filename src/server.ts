@@ -12,6 +12,7 @@ import {
   listSummaries,
 } from './summaries';
 import { checkLLMConnection, listAvailableModels, resetLlmClient } from './llmClient';
+import { getWavDurationMs } from './wavTrim';
 import { isRosterAutomationEnabled } from './teamsJoin';
 
 bootstrapUserConfig();
@@ -241,20 +242,12 @@ app.post('/ui/window', (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-/** Best-effort PCM WAV duration from the standard 44-byte header (our WASAPI writer). */
-function wavDurationSeconds(filePath: string, sizeBytes: number): number | null {
+/** Best-effort PCM WAV duration (parses fmt + data chunks). */
+function wavDurationSeconds(filePath: string): number | null {
   try {
-    const fd = fs.openSync(filePath, 'r');
-    const header = Buffer.alloc(44);
-    const read = fs.readSync(fd, header, 0, 44, 0);
-    fs.closeSync(fd);
-    if (read < 44) return null;
-    if (header.toString('ascii', 0, 4) !== 'RIFF') return null;
-    if (header.toString('ascii', 8, 12) !== 'WAVE') return null;
-    const byteRate = header.readUInt32LE(28);
-    if (!byteRate || byteRate <= 0) return null;
-    const payload = Math.max(0, sizeBytes - 44);
-    return payload / byteRate;
+    const ms = getWavDurationMs(filePath);
+    if (ms == null || !Number.isFinite(ms)) return null;
+    return ms / 1000;
   } catch {
     return null;
   }
@@ -272,7 +265,7 @@ app.get('/recordings', (_req: Request, res: Response) => {
     .map((f) => {
       const filePath = path.join(RECORDINGS_DIR, f);
       const stat = fs.statSync(filePath);
-      const durationSeconds = wavDurationSeconds(filePath, stat.size);
+      const durationSeconds = wavDurationSeconds(filePath);
       return {
         fileName: f,
         sizeBytes: stat.size,

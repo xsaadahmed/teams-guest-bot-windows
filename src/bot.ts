@@ -27,7 +27,7 @@ import { autoTranscribeInBackground } from './autoTranscribe';
 import { RosterMuteTracker } from './rosterMuteTracker';
 import { getLocalParticipantName } from './userConfig';
 import { renameRecordingArtifacts } from './recordingFileName';
-import { trimWavKeepHeadMs } from './wavTrim';
+import { getWavDurationMs, trimWavKeepHeadMs } from './wavTrim';
 
 export type BotState = 'idle' | 'joining' | 'in_meeting' | 'leaving' | 'error';
 
@@ -314,10 +314,19 @@ export class TeamsGuestBot {
       const aloneTrimMs = this.pendingAloneTrimFromRecordingMs;
       if (aloneTrimMs != null && this.recordingFilePath) {
         try {
-          if (trimWavKeepHeadMs(this.recordingFilePath, aloneTrimMs)) {
-            console.log(
-              `[bot] Trimmed alone-wait tail from recording (kept first ${(aloneTrimMs / 1000).toFixed(1)}s)`,
-            );
+          const fileDurationMs = getWavDurationMs(this.recordingFilePath);
+          // Wall-clock alone detection can run slightly ahead of captured audio; never keep
+          // more than the file actually contains.
+          const keepMs =
+            fileDurationMs != null
+              ? Math.min(aloneTrimMs, Math.max(0, fileDurationMs - 50))
+              : aloneTrimMs;
+          if (keepMs > 0 && fileDurationMs != null && keepMs < fileDurationMs - 50) {
+            if (trimWavKeepHeadMs(this.recordingFilePath, keepMs)) {
+              console.log(
+                `[bot] Trimmed alone-wait tail from recording (kept first ${(keepMs / 1000).toFixed(1)}s)`,
+              );
+            }
           }
         } catch (err) {
           console.warn('[bot] Could not trim alone-wait audio from recording:', err);
