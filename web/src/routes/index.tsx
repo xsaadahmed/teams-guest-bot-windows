@@ -22,10 +22,12 @@ import {
   Sparkles,
   Search,
   Upload,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   fetchTranscript,
+  fetchSummary,
   generateSummary,
   getBotConfig,
   getBotStatus,
@@ -123,6 +125,33 @@ type WindowGeometry = { width: number; height: number; x: number; y: number };
 const DEFAULT_MAIN_GEOMETRY: WindowGeometry = { width: 1100, height: 720, x: 80, y: 80 };
 const MIN_MAIN_WIDTH = 640;
 const MIN_MAIN_HEIGHT = 480;
+/** Soft minimum for the main app window — snaps back on resize (not a native OS constraint). */
+const MIN_WINDOW_WIDTH = 800;
+
+function startMainWindowMinWidthGuard(): () => void {
+  let timer: number | null = null;
+
+  const enforce = () => {
+    if (timer != null) window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      timer = null;
+      try {
+        if (window.outerWidth < MIN_WINDOW_WIDTH) {
+          window.resizeTo(MIN_WINDOW_WIDTH, window.outerHeight);
+        }
+      } catch {
+        // resizeTo may be blocked in some environments.
+      }
+    }, 100);
+  };
+
+  window.addEventListener("resize", enforce);
+  enforce();
+  return () => {
+    window.removeEventListener("resize", enforce);
+    if (timer != null) window.clearTimeout(timer);
+  };
+}
 
 function captureWindowGeometry(): WindowGeometry {
   return {
@@ -250,6 +279,12 @@ function Index() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  // Reactive minimum width for the main shell (skipped while the mini overlay is active).
+  useEffect(() => {
+    if (overlayOnly) return;
+    return startMainWindowMinWidthGuard();
+  }, [overlayOnly]);
 
   // First open: ask for the user's Teams display name (mute gating).
   useEffect(() => {
@@ -404,7 +439,11 @@ function Index() {
           {page === "home" && <HomePage setPage={setPage} />}
           {page === "recording" && <RecordingPage />}
           {page === "notes" && (
-            <NotesPage setPage={setPage} selectedModel={selectedModel} />
+            <NotesPage
+              setPage={setPage}
+              selectedModel={selectedModel}
+              onSelectedModelChange={setSelectedModel}
+            />
           )}
           {page === "recordings" && <RecordingsPage setPage={setPage} />}
           {page === "summaries" && (
@@ -561,12 +600,146 @@ const PAGE_WIDE = "mx-auto w-full max-w-[1400px] px-6 py-8 lg:px-10";
 /** Shared centered shell for Transcripts, Recordings, and AI Summaries. */
 const LIST_PAGE = "mx-auto w-full max-w-5xl px-6 py-8";
 const LIST_PAGE_SIZE = 18;
+/** Space reserved to the right of transcript tables for the floating resummarize control. */
+const TRANSCRIPT_RESUMMARIZE_GUTTER = "pr-11";
+const LIST_TABLE_CLASS = "table-fixed";
+const LIST_COL_TITLE_HEAD = "min-w-0";
+const LIST_COL_TITLE_CELL = "min-w-0 overflow-hidden";
+/** Fits longest formatDate() output, e.g. "31/12/2026 12:59 PM" (19 chars) + cell p-2 padding. */
+const LIST_COL_DATE = "w-[calc(19ch+1rem)] shrink-0 whitespace-nowrap";
+const LIST_COL_DURATION = "w-[5.5rem] shrink-0 whitespace-nowrap";
+const LIST_COL_ACTIONS_TRANSCRIPTS = "w-[17.5rem] shrink-0";
+const LIST_COL_ACTIONS_SUMMARIES = "w-[11rem] shrink-0";
+const LIST_COL_ACTIONS_RECORDINGS = "w-[12.5rem] shrink-0";
 /** Fixed width only for Summarize ↔ View Summary (label changes); View sizes naturally. */
 const SUMMARIZE_ACTION_BTN = "w-[122px] justify-center gap-1 px-3 [&_svg]:size-3.5";
 const SUMMARIZE_OUTLINE =
   "border-violet-500/40 text-violet-700 hover:bg-violet-500/10 hover:text-violet-800 dark:text-violet-300 dark:hover:text-violet-200";
 const SUMMARIZE_FILLED =
   "border-transparent bg-violet-600 text-white shadow-sm hover:bg-violet-500 hover:text-white dark:bg-violet-500 dark:hover:bg-violet-400";
+
+function summarizationModelLabel(model: string): string {
+  return model === "auto" ? "Auto" : model;
+}
+
+function summariesByTranscript(summaries: SummaryItem[]): Record<string, SummaryItem> {
+  const map: Record<string, SummaryItem> = {};
+  for (const s of summaries) {
+    if (s.transcriptFileName) map[s.transcriptFileName] = s;
+  }
+  return map;
+}
+
+function useAvailableModels() {
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setModelsLoading(true);
+    setModelsError(null);
+    listAvailableModels()
+      .then((models) => {
+        if (!cancelled) setAvailableModels(models);
+      })
+      .catch((e) => {
+        if (!cancelled) setModelsError((e as Error).message);
+      })
+      .finally(() => {
+        if (!cancelled) setModelsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return { availableModels, modelsLoading, modelsError };
+}
+
+function SummarizationModelSelect({
+  selectedModel,
+  onSelectedModelChange,
+  availableModels,
+  modelsLoading,
+  modelsError,
+}: {
+  selectedModel: string;
+  onSelectedModelChange: (model: string) => void;
+  availableModels: string[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs font-medium text-muted-foreground">Model</span>
+      <Select value={selectedModel} onValueChange={onSelectedModelChange}>
+        <SelectTrigger
+          className="h-8 w-[100px] px-3 text-xs"
+          aria-label="Summarization model"
+          disabled={modelsLoading && selectedModel !== "auto"}
+        >
+          <SelectValue placeholder="Auto" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="auto">Auto</SelectItem>
+          {modelsLoading ? (
+            <SelectItem value="__loading__" disabled>
+              Loading...
+            </SelectItem>
+          ) : null}
+          {!modelsLoading && modelsError ? (
+            <SelectItem value="__error__" disabled>
+              Models unavailable
+            </SelectItem>
+          ) : null}
+          {!modelsLoading &&
+            !modelsError &&
+            availableModels.map((m) => (
+              <SelectItem key={m} value={m}>
+                {m}
+              </SelectItem>
+            ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function ResummarizeIconButton({
+  busy,
+  disabled,
+  onClick,
+  className,
+}: {
+  busy?: boolean;
+  disabled?: boolean;
+  onClick: (e: React.MouseEvent) => void;
+  className?: string;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="outline"
+          size="icon"
+          className={cn("h-8 w-8 shrink-0", className)}
+          disabled={disabled || busy}
+          onClick={onClick}
+        >
+          {busy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <RefreshCw className="h-4 w-4" />
+          )}
+          <span className="sr-only">Resummarize</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top">Resummarize</TooltipContent>
+    </Tooltip>
+  );
+}
 
 const BROWSE_CARD_ACCENT = "text-muted-foreground bg-secondary";
 const BROWSE_CARD_CLASS =
@@ -692,7 +865,7 @@ function ListSearch({
 
 function TruncatedTitle({ title, subtitle }: { title: string; subtitle?: string }) {
   return (
-    <div className="min-w-0 max-w-md">
+    <div className="min-w-0 w-full overflow-hidden">
       <Tooltip>
         <TooltipTrigger asChild>
           <div className="truncate font-medium">{title}</div>
@@ -730,24 +903,31 @@ function ListEmptyState({
   );
 }
 
-function ListTableSkeleton({ variant }: { variant: "transcripts" | "recordings" }) {
+function ListTableSkeleton({ variant }: { variant: "transcripts" | "summaries" | "recordings" }) {
+  const actionsCol =
+    variant === "recordings"
+      ? LIST_COL_ACTIONS_RECORDINGS
+      : variant === "summaries"
+        ? LIST_COL_ACTIONS_SUMMARIES
+        : LIST_COL_ACTIONS_TRANSCRIPTS;
+
   return (
     <>
       {Array.from({ length: 6 }).map((_, i) => (
         <TableRow key={i}>
-          <TableCell className="max-w-md">
-            <Skeleton className="h-4 w-48" />
-            <Skeleton className="h-3 w-16 mt-2" />
+          <TableCell className={LIST_COL_TITLE_CELL}>
+            <Skeleton className="h-4 w-48 max-w-full" />
+            <Skeleton className="h-3 w-16 mt-2 max-w-full" />
           </TableCell>
           {variant === "recordings" && (
-            <TableCell>
+            <TableCell className={LIST_COL_DURATION}>
               <Skeleton className="h-4 w-10" />
             </TableCell>
           )}
-          <TableCell>
+          <TableCell className={LIST_COL_DATE}>
             <Skeleton className="h-4 w-28" />
           </TableCell>
-          <TableCell className="text-right">
+          <TableCell className={cn("text-right", actionsCol)}>
             <Skeleton className="ml-auto h-8 w-36" />
           </TableCell>
         </TableRow>
@@ -945,9 +1125,29 @@ function SummariesPage({
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [viewingId, setViewingId] = useState<string | null>(null);
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [modelsLoading, setModelsLoading] = useState(false);
-  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [viewedSummary, setViewedSummary] = useState<SummaryItem | null>(null);
+  const [summaryViewerLoading, setSummaryViewerLoading] = useState(false);
+  const [resummarizingIds, setResummarizingIds] = useState<Record<string, boolean>>({});
+  const { availableModels, modelsLoading, modelsError } = useAvailableModels();
+
+  const openSummaryViewer = async (id: string, fallback?: SummaryItem) => {
+    setViewingId(id);
+    setSummaryViewerLoading(true);
+    setViewedSummary(fallback ?? null);
+    try {
+      const summary = await fetchSummary(id);
+      setViewedSummary(summary);
+      setItems((prev) => prev.map((item) => (item.id === summary.id ? summary : item)));
+    } catch (e) {
+      if (!fallback) {
+        setViewingId(null);
+        setViewedSummary(null);
+        toast.error((e as Error).message || "Could not load summary");
+      }
+    } finally {
+      setSummaryViewerLoading(false);
+    }
+  };
 
   useEffect(() => {
     listSummaries()
@@ -956,32 +1156,37 @@ function SummariesPage({
       .finally(() => setLoading(false));
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    setModelsLoading(true);
-    setModelsError(null);
-    listAvailableModels()
-      .then((models) => {
-        if (cancelled) return;
-        setAvailableModels(models);
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setModelsError((e as Error).message);
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setModelsLoading(false);
+  const handleResummarize = async (s: SummaryItem) => {
+    if (!s.transcriptFileName || resummarizingIds[s.id]) return;
+    const modelToUse = selectedModel === "auto" ? undefined : selectedModel;
+    const modelLabel = summarizationModelLabel(selectedModel);
+    setResummarizingIds((prev) => ({ ...prev, [s.id]: true }));
+    const toastId = toast.loading(`Resummarizing with ${modelLabel}…`);
+    try {
+      const summary = await generateSummary(s.transcriptFileName, modelToUse, { force: true });
+      setItems((prev) => prev.map((item) => (item.id === summary.id ? summary : item)));
+      if (viewingId === summary.id) setViewedSummary(summary);
+      toast.success(`Summary updated for ${summary.title || s.title}`, {
+        id: toastId,
+        action: {
+          label: "View",
+          onClick: () => void openSummaryViewer(summary.id, summary),
+        },
       });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    } catch (e) {
+      toast.error((e as Error).message || "Could not resummarize", { id: toastId });
+    } finally {
+      setResummarizingIds((prev) => {
+        const next = { ...prev };
+        delete next[s.id];
+        return next;
+      });
+    }
+  };
 
   useEffect(() => {
     if (!focusSummaryId) return;
-    setViewingId(focusSummaryId);
+    void openSummaryViewer(focusSummaryId);
     onFocusConsumed?.();
   }, [focusSummaryId, onFocusConsumed]);
 
@@ -990,8 +1195,6 @@ function SummariesPage({
     ? items.filter((s) => s.title.toLowerCase().includes(q) || s.text.toLowerCase().includes(q))
     : items;
   const { page, totalPages, pageItems, setPage: setListPage } = useListPagination(filtered, query);
-
-  const activeItem = items.find((s) => s.id === viewingId);
 
   const summarySearchPlaceholder = listSearchPlaceholder(
     loading ? undefined : items.length,
@@ -1006,38 +1209,13 @@ function SummariesPage({
         description="AI-generated summaries of your recorded meetings"
         action={
           <div className="flex shrink-0 items-center gap-3">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Model</span>
-              <Select value={selectedModel} onValueChange={onSelectedModelChange}>
-                <SelectTrigger
-                  className="h-8 w-[100px] px-3 text-xs"
-                  aria-label="Summarization model"
-                  disabled={modelsLoading && selectedModel !== "auto"}
-                >
-                  <SelectValue placeholder="Auto" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="auto">Auto</SelectItem>
-                  {modelsLoading ? (
-                    <SelectItem value="__loading__" disabled>
-                      Loading...
-                    </SelectItem>
-                  ) : null}
-                  {!modelsLoading && modelsError ? (
-                    <SelectItem value="__error__" disabled>
-                      Models unavailable
-                    </SelectItem>
-                  ) : null}
-                  {!modelsLoading &&
-                    !modelsError &&
-                    availableModels.map((m) => (
-                      <SelectItem key={m} value={m}>
-                        {m}
-                      </SelectItem>
-                    ))}
-                </SelectContent>
-              </Select>
-            </div>
+            <SummarizationModelSelect
+              selectedModel={selectedModel}
+              onSelectedModelChange={onSelectedModelChange}
+              availableModels={availableModels}
+              modelsLoading={modelsLoading}
+              modelsError={modelsError}
+            />
             <Button size="sm" className={SUMMARIZE_FILLED} onClick={() => setPage("notes")}>
               <Sparkles className="h-4 w-4" />
               Summarize a transcript
@@ -1065,16 +1243,16 @@ function SummariesPage({
             ariaLabel="Search summaries"
           />
           <div className="rounded-md border">
-            <Table>
+            <Table className={LIST_TABLE_CLASS}>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="max-w-md">Title</TableHead>
-                  <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[5.5rem]" />
+                  <TableHead className={LIST_COL_TITLE_HEAD}>Title</TableHead>
+                  <TableHead className={LIST_COL_DATE}>Date</TableHead>
+                  <TableHead className={LIST_COL_ACTIONS_SUMMARIES} />
                 </TableRow>
               </TableHeader>
               <TableBody>
-                <ListTableSkeleton variant="transcripts" />
+                <ListTableSkeleton variant="summaries" />
               </TableBody>
             </Table>
           </div>
@@ -1099,12 +1277,12 @@ function SummariesPage({
             ariaLabel="Search summaries"
           />
           <div className="rounded-md border">
-            <Table>
+            <Table className={LIST_TABLE_CLASS}>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="max-w-md">Title</TableHead>
-                  <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[5.5rem]" />
+                  <TableHead className={LIST_COL_TITLE_HEAD}>Title</TableHead>
+                  <TableHead className={LIST_COL_DATE}>Date</TableHead>
+                  <TableHead className={LIST_COL_ACTIONS_SUMMARIES} />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1119,28 +1297,40 @@ function SummariesPage({
                     <TableRow
                       key={s.id}
                       className="cursor-pointer hover:bg-muted/50"
-                      onClick={() => setViewingId(s.id)}
+                      onClick={() => void openSummaryViewer(s.id, s)}
                     >
-                      <TableCell className="max-w-md">
+                      <TableCell className={LIST_COL_TITLE_CELL}>
                         <TruncatedTitle
                           title={s.title}
                           subtitle={formatRelativeTime(s.lastModified)}
                         />
                       </TableCell>
-                      <TableCell className="text-muted-foreground whitespace-nowrap">
+                      <TableCell className={cn("text-muted-foreground", LIST_COL_DATE)}>
                         {formatDate(s.lastModified)}
                       </TableCell>
-                      <TableCell className="text-right">
-                        <Button
-                          variant="outline"
-                          size="sm"
+                      <TableCell className={cn("text-right", LIST_COL_ACTIONS_SUMMARIES)}>
+                        <div className="inline-flex items-center justify-end">
+                          <Button
+                            variant="outline"
+                            size="sm"
                           onClick={(e) => {
                             e.stopPropagation();
-                            setViewingId(s.id);
+                            void openSummaryViewer(s.id, s);
                           }}
-                        >
-                          View
-                        </Button>
+                          >
+                            View
+                          </Button>
+                          {s.transcriptFileName ? (
+                            <ResummarizeIconButton
+                              className="ml-2"
+                              busy={!!resummarizingIds[s.id]}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleResummarize(s);
+                              }}
+                            />
+                          ) : null}
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))
@@ -1153,15 +1343,27 @@ function SummariesPage({
       )}
 
       <DetailViewerDialog
+        key={viewedSummary?.lastModified ?? viewingId ?? "closed"}
         open={viewingId !== null}
-        onOpenChange={(open) => !open && setViewingId(null)}
-        title={activeItem?.title ?? "AI Summary"}
-        description={activeItem ? formatDate(activeItem.lastModified) : undefined}
-        copyText={activeItem?.text}
+        onOpenChange={(open) => {
+          if (!open) {
+            setViewingId(null);
+            setViewedSummary(null);
+          }
+        }}
+        title={viewedSummary?.title ?? "AI Summary"}
+        description={viewedSummary ? formatDate(viewedSummary.lastModified) : undefined}
+        copyText={viewedSummary?.text}
       >
-        {activeItem && (
+        {summaryViewerLoading && !viewedSummary ? (
+          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading summary…
+          </div>
+        ) : null}
+        {viewedSummary && (
           <div className="min-h-0 max-h-[60vh] flex-1 overflow-y-auto rounded-md border bg-muted/20">
-            <pre className="p-4 text-sm whitespace-pre-wrap">{activeItem.text}</pre>
+            <pre className="p-4 text-sm whitespace-pre-wrap">{viewedSummary.text}</pre>
           </div>
         )}
       </DetailViewerDialog>
@@ -1510,9 +1712,11 @@ function recordingDisplayTitle(fileName: string) {
 function NotesPage({
   setPage,
   selectedModel,
+  onSelectedModelChange,
 }: {
   setPage: (p: Page) => void;
   selectedModel: string;
+  onSelectedModelChange: (model: string) => void;
 }) {
   const [items, setItems] = useState<TranscriptItem[]>([]);
   const [summaryByTranscript, setSummaryByTranscript] = useState<Record<string, SummaryItem>>({});
@@ -1527,6 +1731,30 @@ function NotesPage({
   const [uploading, setUploading] = useState(false);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const [viewingSummaryId, setViewingSummaryId] = useState<string | null>(null);
+  const [viewedSummary, setViewedSummary] = useState<SummaryItem | null>(null);
+  const [summaryViewerLoading, setSummaryViewerLoading] = useState(false);
+  const { availableModels, modelsLoading, modelsError } = useAvailableModels();
+
+  const openSummaryViewer = async (id: string, fallback?: SummaryItem) => {
+    setViewingSummaryId(id);
+    setSummaryViewerLoading(true);
+    setViewedSummary(fallback ?? null);
+    try {
+      const summary = await fetchSummary(id);
+      setViewedSummary(summary);
+      if (summary.transcriptFileName) {
+        setSummaryByTranscript((prev) => ({ ...prev, [summary.transcriptFileName]: summary }));
+      }
+    } catch (e) {
+      if (!fallback) {
+        setViewingSummaryId(null);
+        setViewedSummary(null);
+        toast.error((e as Error).message || "Could not load summary");
+      }
+    } finally {
+      setSummaryViewerLoading(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1547,11 +1775,7 @@ function NotesPage({
     listSummaries()
       .then((summaries) => {
         if (cancelled) return;
-        const map: Record<string, SummaryItem> = {};
-        for (const s of summaries) {
-          if (s.transcriptFileName) map[s.transcriptFileName] = s;
-        }
-        setSummaryByTranscript(map);
+        setSummaryByTranscript((prev) => ({ ...summariesByTranscript(summaries), ...prev }));
       })
       .catch(() => {
         /* Summarize actions still work; map stays empty until generate succeeds. */
@@ -1588,11 +1812,39 @@ function NotesPage({
       toast.success(`Summary ready for ${summary.title || t.title}`, {
         action: {
           label: "View",
-          onClick: () => setViewingSummaryId(summary.id),
+          onClick: () => void openSummaryViewer(summary.id, summary),
         },
       });
     } catch (e) {
       toast.error((e as Error).message || "Could not generate summary");
+    } finally {
+      setSummarizingFiles((prev) => {
+        const next = { ...prev };
+        delete next[t.fileName];
+        return next;
+      });
+    }
+  };
+
+  const handleResummarize = async (t: TranscriptItem) => {
+    if (summarizingFiles[t.fileName]) return;
+    const modelToUse = selectedModel === "auto" ? undefined : selectedModel;
+    const modelLabel = summarizationModelLabel(selectedModel);
+    setSummarizingFiles((prev) => ({ ...prev, [t.fileName]: true }));
+    const toastId = toast.loading(`Resummarizing with ${modelLabel}…`);
+    try {
+      const summary = await generateSummary(t.fileName, modelToUse, { force: true });
+      setSummaryByTranscript((prev) => ({ ...prev, [t.fileName]: summary }));
+      if (viewingSummaryId === summary.id) setViewedSummary(summary);
+      toast.success(`Summary updated for ${summary.title || t.title}`, {
+        id: toastId,
+        action: {
+          label: "View",
+          onClick: () => void openSummaryViewer(summary.id, summary),
+        },
+      });
+    } catch (e) {
+      toast.error((e as Error).message || "Could not resummarize", { id: toastId });
     } finally {
       setSummarizingFiles((prev) => {
         const next = { ...prev };
@@ -1634,9 +1886,6 @@ function NotesPage({
 
   const activeItem = items.find((t) => t.fileName === viewingFile);
   const activeText = viewingFile ? textByFile[viewingFile] : "";
-  const activeSummary = viewingSummaryId
-    ? Object.values(summaryByTranscript).find((s) => s.id === viewingSummaryId) ?? null
-    : null;
 
   const transcriptSearchPlaceholder = listSearchPlaceholder(
     loading ? undefined : items.length,
@@ -1650,6 +1899,13 @@ function NotesPage({
         description="Speaker-labeled transcripts from your recordings"
         action={
           <div className="flex shrink-0 items-center gap-3">
+            <SummarizationModelSelect
+              selectedModel={selectedModel}
+              onSelectedModelChange={onSelectedModelChange}
+              availableModels={availableModels}
+              modelsLoading={modelsLoading}
+              modelsError={modelsError}
+            />
             <input
               ref={uploadInputRef}
               type="file"
@@ -1692,19 +1948,21 @@ function NotesPage({
             placeholder={transcriptSearchPlaceholder}
             ariaLabel="Search transcripts"
           />
-          <div className="rounded-md border">
-            <Table>
+          <div className={cn("relative", TRANSCRIPT_RESUMMARIZE_GUTTER)}>
+            <div className="rounded-md border">
+              <Table className={LIST_TABLE_CLASS} containerClassName="overflow-visible">
               <TableHeader>
                 <TableRow>
-                  <TableHead className="max-w-md">Title</TableHead>
-                  <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[13.5rem]" />
+                  <TableHead className={LIST_COL_TITLE_HEAD}>Title</TableHead>
+                  <TableHead className={LIST_COL_DATE}>Date</TableHead>
+                  <TableHead className={LIST_COL_ACTIONS_TRANSCRIPTS} />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 <ListTableSkeleton variant="transcripts" />
               </TableBody>
             </Table>
+            </div>
           </div>
         </>
       )}
@@ -1724,13 +1982,14 @@ function NotesPage({
             placeholder={transcriptSearchPlaceholder}
             ariaLabel="Search transcripts"
           />
-          <div className="rounded-md border">
-            <Table>
+          <div className={cn("relative", TRANSCRIPT_RESUMMARIZE_GUTTER)}>
+            <div className="rounded-md border">
+              <Table className={LIST_TABLE_CLASS} containerClassName="overflow-visible">
               <TableHeader>
                 <TableRow>
-                  <TableHead className="max-w-md">Title</TableHead>
-                  <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[13.5rem]" />
+                  <TableHead className={LIST_COL_TITLE_HEAD}>Title</TableHead>
+                  <TableHead className={LIST_COL_DATE}>Date</TableHead>
+                  <TableHead className={LIST_COL_ACTIONS_TRANSCRIPTS} />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1747,19 +2006,24 @@ function NotesPage({
                     return (
                       <TableRow
                         key={t.fileName}
-                        className="cursor-pointer hover:bg-muted/50"
+                        className="relative cursor-pointer hover:bg-muted/50"
                         onClick={() => void openTranscript(t.fileName)}
                       >
-                        <TableCell className="max-w-md">
+                        <TableCell className={LIST_COL_TITLE_CELL}>
                           <TruncatedTitle
                             title={t.title}
                             subtitle={formatRelativeTime(t.lastModified)}
                           />
                         </TableCell>
-                        <TableCell className="text-muted-foreground whitespace-nowrap">
+                        <TableCell className={cn("text-muted-foreground", LIST_COL_DATE)}>
                           {formatDate(t.lastModified)}
                         </TableCell>
-                        <TableCell className="text-right">
+                        <TableCell
+                          className={cn(
+                            "relative overflow-visible text-right",
+                            LIST_COL_ACTIONS_TRANSCRIPTS,
+                          )}
+                        >
                           <div className="inline-flex items-center justify-end gap-1.5">
                             <Button
                               variant="outline"
@@ -1773,17 +2037,28 @@ function NotesPage({
                               View
                             </Button>
                             {existing ? (
-                              <Button
-                                size="sm"
-                                className={cn(SUMMARIZE_ACTION_BTN, SUMMARIZE_FILLED)}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setViewingSummaryId(existing.id);
-                                }}
-                              >
-                                <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                                View Summary
-                              </Button>
+                              <>
+                                <Button
+                                  size="sm"
+                                  className={cn(SUMMARIZE_ACTION_BTN, SUMMARIZE_FILLED)}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void openSummaryViewer(existing.id, existing);
+                                  }}
+                                >
+                                  <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                                  View Summary
+                                </Button>
+                                <span className="sm:hidden">
+                                  <ResummarizeIconButton
+                                    busy={busy}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void handleResummarize(t);
+                                    }}
+                                  />
+                                </span>
+                              </>
                             ) : (
                               <Button
                                 variant="outline"
@@ -1804,6 +2079,17 @@ function NotesPage({
                               </Button>
                             )}
                           </div>
+                          {existing ? (
+                            <div className="absolute top-1/2 left-full z-10 ml-3 hidden -translate-y-1/2 sm:block">
+                              <ResummarizeIconButton
+                                busy={busy}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleResummarize(t);
+                                }}
+                              />
+                            </div>
+                          ) : null}
                         </TableCell>
                       </TableRow>
                     );
@@ -1811,6 +2097,7 @@ function NotesPage({
                 )}
               </TableBody>
             </Table>
+            </div>
           </div>
           <ListPagination page={page} totalPages={totalPages} onPageChange={setListPage} />
         </>
@@ -1844,15 +2131,27 @@ function NotesPage({
       </DetailViewerDialog>
 
       <DetailViewerDialog
+        key={viewedSummary?.lastModified ?? viewingSummaryId ?? "closed"}
         open={viewingSummaryId !== null}
-        onOpenChange={(open) => !open && setViewingSummaryId(null)}
-        title={activeSummary?.title ?? "AI Summary"}
-        description={activeSummary ? formatDate(activeSummary.lastModified) : undefined}
-        copyText={activeSummary?.text}
+        onOpenChange={(open) => {
+          if (!open) {
+            setViewingSummaryId(null);
+            setViewedSummary(null);
+          }
+        }}
+        title={viewedSummary?.title ?? "AI Summary"}
+        description={viewedSummary ? formatDate(viewedSummary.lastModified) : undefined}
+        copyText={viewedSummary?.text}
       >
-        {activeSummary && (
+        {summaryViewerLoading && !viewedSummary ? (
+          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading summary…
+          </div>
+        ) : null}
+        {viewedSummary && (
           <div className="min-h-0 max-h-[60vh] flex-1 overflow-y-auto rounded-md border bg-muted/20">
-            <pre className="p-4 text-sm whitespace-pre-wrap">{activeSummary.text}</pre>
+            <pre className="p-4 text-sm whitespace-pre-wrap">{viewedSummary.text}</pre>
           </div>
         )}
       </DetailViewerDialog>
@@ -1911,13 +2210,13 @@ function RecordingsPage({ setPage }: { setPage: (p: Page) => void }) {
             ariaLabel="Search recordings"
           />
           <div className="rounded-md border">
-            <Table>
+            <Table className={LIST_TABLE_CLASS}>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="max-w-md">Title</TableHead>
-                  <TableHead className="w-[5.5rem] whitespace-nowrap">Duration</TableHead>
-                  <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[11.5rem]" />
+                  <TableHead className={LIST_COL_TITLE_HEAD}>Title</TableHead>
+                  <TableHead className={LIST_COL_DURATION}>Duration</TableHead>
+                  <TableHead className={LIST_COL_DATE}>Date</TableHead>
+                  <TableHead className={LIST_COL_ACTIONS_RECORDINGS} />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1941,13 +2240,13 @@ function RecordingsPage({ setPage }: { setPage: (p: Page) => void }) {
             ariaLabel="Search recordings"
           />
           <div className="rounded-md border">
-            <Table>
+            <Table className={LIST_TABLE_CLASS}>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="max-w-md">Title</TableHead>
-                  <TableHead className="w-[5.5rem] whitespace-nowrap">Duration</TableHead>
-                  <TableHead className="w-[11rem] whitespace-nowrap">Date</TableHead>
-                  <TableHead className="w-[11.5rem]" />
+                  <TableHead className={LIST_COL_TITLE_HEAD}>Title</TableHead>
+                  <TableHead className={LIST_COL_DURATION}>Duration</TableHead>
+                  <TableHead className={LIST_COL_DATE}>Date</TableHead>
+                  <TableHead className={LIST_COL_ACTIONS_RECORDINGS} />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1966,19 +2265,19 @@ function RecordingsPage({ setPage }: { setPage: (p: Page) => void }) {
                         className="cursor-pointer hover:bg-muted/50"
                         onClick={() => setPlayingFile(r.fileName)}
                       >
-                        <TableCell className="max-w-md">
+                        <TableCell className={LIST_COL_TITLE_CELL}>
                           <TruncatedTitle
                             title={title}
                             subtitle={formatRelativeTime(r.lastModified)}
                           />
                         </TableCell>
-                        <TableCell className="tabular-nums whitespace-nowrap">
+                        <TableCell className={cn("tabular-nums", LIST_COL_DURATION)}>
                           {formatDuration(r.durationSeconds)}
                         </TableCell>
-                        <TableCell className="text-muted-foreground whitespace-nowrap">
+                        <TableCell className={cn("text-muted-foreground", LIST_COL_DATE)}>
                           {formatDate(r.lastModified)}
                         </TableCell>
-                        <TableCell className="p-2">
+                        <TableCell className={cn("p-2", LIST_COL_ACTIONS_RECORDINGS)}>
                           <div className="flex flex-row flex-nowrap items-center justify-end gap-2">
                             <Button
                               variant="outline"

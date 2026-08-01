@@ -197,7 +197,11 @@ export async function uploadTranscript(file: File): Promise<TranscriptItem> {
 }
 
 export function listSummaries(): Promise<SummaryItem[]> {
-  return api<SummaryItem[]>("/summaries");
+  return api<SummaryItem[]>("/summaries", { cache: "no-store" });
+}
+
+export function fetchSummary(id: string): Promise<SummaryItem> {
+  return api<SummaryItem>(`/summaries/${encodeURIComponent(id)}`, { cache: "no-store" });
 }
 
 export function listAvailableModels(): Promise<string[]> {
@@ -205,10 +209,18 @@ export function listAvailableModels(): Promise<string[]> {
 }
 
 /** Manually generate a summary for a transcript (no auto-trigger). */
-export function generateSummary(transcriptFileName: string, model?: string): Promise<SummaryItem> {
+export function generateSummary(
+  transcriptFileName: string,
+  model?: string,
+  options?: { force?: boolean },
+): Promise<SummaryItem> {
   return api<SummaryItem>("/summaries", {
     method: "POST",
-    body: JSON.stringify({ transcriptFileName, ...(model ? { model } : {}) }),
+    body: JSON.stringify({
+      transcriptFileName,
+      ...(model ? { model } : {}),
+      ...(options?.force ? { force: true } : {}),
+    }),
   });
 }
 

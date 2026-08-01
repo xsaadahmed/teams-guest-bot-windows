@@ -524,6 +524,14 @@ function normalizeParticipantName(name: string): string {
     .trim();
 }
 
+/** Speaker+text fingerprint used to detect hand-edits to the rendered .txt file. */
+function turnContentFingerprint(turns: Turn[]): string {
+  return turns
+    .map((t) => `${normalizeString(t.speaker)}|${normalizeString(t.text)}`)
+    .filter((line) => line !== '|')
+    .join('\n');
+}
+
 function buildParticipants(raw: string[], exclude: string[]): string[] {
   const excludeSet = new Set(exclude.map((e) => normalizeParticipantName(e).toLowerCase()).filter(Boolean));
   const seen = new Set<string>();
@@ -570,17 +578,37 @@ export function preprocessTranscript(
 
   const namedTurns = input.namedSidecar ? turnsFromNamedSidecar(input.namedSidecar) : [];
   const captionTurns = input.captionsSidecar ? turnsFromCaptionsSidecar(input.captionsSidecar) : [];
+  const rawFingerprint = turnContentFingerprint(parsed.turns);
+  const rawHasTurnText = parsed.turns.some((t) => normalizeString(t.text).length > 0);
 
+  const transcriptEditedAwayFrom = (sidecarTurns: Turn[]): boolean =>
+    rawHasTurnText && rawFingerprint !== turnContentFingerprint(sidecarTurns);
+
+  // Prefer sidecars for timing (tEndMs) when the .txt still matches what was written from them.
+  // If the user edited the .txt in an editor, trust the file instead of stale JSON.
   if (namedTurns.length > 0) {
-    source = 'named';
-    usedSidecar = true;
-    turns = namedTurns;
+    if (transcriptEditedAwayFrom(namedTurns)) {
+      source = 'named';
+      usedSidecar = false;
+      turns = parsed.turns;
+    } else {
+      source = 'named';
+      usedSidecar = true;
+      turns = namedTurns;
+    }
   } else if (captionTurns.length > 0) {
-    source = 'captions';
-    usedSidecar = true;
-    turns = captionTurns;
-    if (participantsRaw.length === 0 && input.captionsSidecar?.participants) {
-      participantsRaw = input.captionsSidecar.participants;
+    if (transcriptEditedAwayFrom(captionTurns)) {
+      source =
+        parsed.structureRatio >= STRUCTURE_THRESHOLD && parsed.turns.length > 0 ? 'captions' : 'unstructured';
+      usedSidecar = false;
+      turns = parsed.turns;
+    } else {
+      source = 'captions';
+      usedSidecar = true;
+      turns = captionTurns;
+      if (participantsRaw.length === 0 && input.captionsSidecar?.participants) {
+        participantsRaw = input.captionsSidecar.participants;
+      }
     }
   } else if (parsed.structureRatio >= STRUCTURE_THRESHOLD && parsed.turns.length > 0) {
     source = input.raw.toLowerCase().includes('verbatim transcript') ? 'named' : 'captions';
