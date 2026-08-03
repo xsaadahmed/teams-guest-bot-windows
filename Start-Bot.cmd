@@ -65,6 +65,15 @@ if not defined RECORDINGS_DIR set "RECORDINGS_DIR=%CD%\Recordings"
 if not exist "%RECORDINGS_DIR%" mkdir "%RECORDINGS_DIR%"
 echo Recordings directory: %RECORDINGS_DIR%
 
+REM Corporate laptops often block Playwright temp under default %%TEMP%% (EPERM).
+REM Use a project-local folder unless TEAMS_BOT_USE_SYSTEM_TEMP=1.
+if not "%TEAMS_BOT_USE_SYSTEM_TEMP%"=="1" if /i not "%TEAMS_BOT_USE_SYSTEM_TEMP%"=="true" (
+  if not exist "%CD%\.bot-temp" mkdir "%CD%\.bot-temp"
+  set "TEMP=%CD%\.bot-temp"
+  set "TMP=%CD%\.bot-temp"
+)
+if not defined TEAMS_BOT_BROWSER_PROFILE set "TEAMS_BOT_BROWSER_PROFILE=%CD%\.teams-bot-browser-profile"
+
 if defined LOCAL_PARTICIPANT_NAME (
   echo Local participant [mute-gated mic]: %LOCAL_PARTICIPANT_NAME%
 ) else (

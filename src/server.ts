@@ -1,3 +1,4 @@
+import './bootstrapWinEnv';
 import express, { Request, Response } from 'express';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
@@ -44,6 +45,8 @@ function openWebUiWindow(port: number): void {
     // Fallbacks when Edge/Chrome aren't on PATH (App Paths via start).
     { label: 'msedge-start', command: 'cmd', args: ['/c', 'start', '', '/b', 'msedge', `--app=${url}`] },
     { label: 'chrome-start', command: 'cmd', args: ['/c', 'start', '', '/b', 'chrome', `--app=${url}`] },
+    // Corporate policy sometimes blocks --app= launches from Node; plain URL often still works.
+    { label: 'default-browser', command: 'cmd', args: ['/c', 'start', '', '', url] },
   ];
 
   const tryNext = (i: number) => {

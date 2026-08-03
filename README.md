@@ -165,6 +165,7 @@ python transcribe\transcribe_with_names.py Recordings\<name>.wav --engine faster
 |---|---|
 | Bot never appears in Teams | Admit from lobby; check meeting link (strip `.rproxy.goskope.com` if present) |
 | Join fails: Chromium missing | Run `npx playwright install chromium` with `PLAYWRIGHT_BROWSERS_PATH=0` (dev) or re-unpack deployment bundle |
+| `EPERM` on `playwright-artifacts` in Temp | Fixed automatically — `Start-Bot.cmd` uses `.bot-temp/` in the project folder |
 | Port 3000 in use | Bot auto-tries 3001, then 3847 — check console for `listening on :...` |
 | No `.transcript.txt` | Captions may not have turned on — see `src/captionTracker.ts` |
 | Accurate transcription disabled | No STT package detected — install faster-whisper in Python, refresh Settings |

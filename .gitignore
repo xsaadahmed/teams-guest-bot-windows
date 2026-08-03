@@ -4,6 +4,7 @@ node/
 PORTABLE-BUNDLE.txt
 Recordings/
 .teams-bot-browser-profile/
+.bot-temp/
 *.log
 .env
 .teams-bot-config.json
