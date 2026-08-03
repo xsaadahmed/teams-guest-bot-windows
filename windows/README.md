@@ -1,29 +1,24 @@
-# Running teams-guest-bot natively on Windows (no Docker/WSL2)
+# Running teams-guest-bot on Windows
 
-This is the AVD-laptop path: no admin rights, no reboot, no nested virtualization, so
-Docker Desktop/WSL2 can never run there. This runs the exact same bot as a normal Windows
-process on the physical laptop instead, which has none of those restrictions.
+Native Windows deployment: no Docker, no WSL2, no admin rights for the portable bundle path.
+Runs as a normal process on the physical laptop with real desktop audio (WASAPI) and Playwright
+Chromium.
 
-## What actually changed
+## What makes Windows different
 
-Only the two pieces that were genuinely Linux-specific:
+Only the audio/display stack is platform-specific:
 
-| Piece | Linux/Docker | Windows |
-|---|---|---|
-| Display for the headed browser | Xvfb (virtual framebuffer) | Nothing needed - a normal Windows desktop session already has a real one |
-| "Record what the browser is playing" | PulseAudio virtual sink + `ffmpeg -f pulse` | WASAPI loopback capture via a small bundled `.exe` (`windows/WasapiLoopbackRecorder`) |
+| Piece | Windows (this repo) |
+|---|---|
+| Display for the headed browser | Normal Windows desktop session |
+| Record what the browser plays | WASAPI loopback via `windows/WasapiLoopbackRecorder` |
+| Local mic in the mix | Direct mic capture in the same helper |
 
-That's it. Everything else - joining the meeting, the lobby/name-entry flow, reading Teams'
-live captions, the HTTP API, the transcript file format - is plain Playwright browser
-automation and plain Node.js. None of it touches the OS. `server.ts`, `teamsJoin.ts`,
-`captionTracker.ts`, and `teamsUrl.ts` are **unmodified**.
+Everything else — joining the meeting, lobby flow, live captions, HTTP API, transcript format —
+is Playwright + Node.js in `src/teamsJoin.ts`, `src/captionTracker.ts`, `src/server.ts`, etc.
 
-`browserLaunch.ts` changed only to: drop `--use-pulseaudio` and the Linux sandbox flags on
-Windows (see comments in that file for why `--no-sandbox` specifically is worth NOT carrying
-over to a managed corporate laptop), and add an optional window-minimizing helper (off by
-default - see "Window visibility" below). `headless: false` is unchanged and deliberate on
-both platforms - Teams' WebRTC join flow is unreliable in Chromium's true headless mode,
-which is the whole reason Xvfb existed in the first place, not something specific to Linux.
+`browserLaunch.ts` uses Windows-appropriate Chromium flags. `headless: false` is deliberate —
+Teams' WebRTC join flow is unreliable in true headless mode.
 
 ## Why WASAPI loopback via a small `.exe`, and not ffmpeg directly
 
@@ -91,24 +86,21 @@ in the main README - the HTTP API didn't change.
 
 ## Config
 
-Same env vars as the Docker path (`RECORDINGS_DIR`, `DEFAULT_DISPLAY_NAME`, `CHROME_PATH`,
-`X11_WIDTH`/`X11_HEIGHT` - yes, still called that; see the comment in `browserLaunch.ts` for
-why they weren't renamed), plus two new, both **opt-in and off by default**:
+Environment variables (see also `Start-Bot.cmd`):
+
+- `RECORDINGS_DIR`, `DEFAULT_DISPLAY_NAME`, `CHROME_PATH`
+- `X11_WIDTH` / `X11_HEIGHT` — window size hints for Chromium (legacy names; still used on Windows)
 
 - `WASAPI_HELPER_PATH` - point at the compiled helper if it's not at the default
-  `windows/WasapiLoopbackRecorder/publish/WasapiLoopbackRecorder.exe` (e.g. once this is
-  eventually packaged into a single distributable `.exe`).
+  `windows/WasapiLoopbackRecorder/publish/WasapiLoopbackRecorder.exe`.
 - `WASAPI_RENDER_DEVICE` - override loopback endpoint if Chromium plays to a non-default device.
-  By default the helper loopbacks **both** Communications and Multimedia render endpoints
-  when they differ (Teams/WebRTC often uses Communications on Windows).
-- `MINIMIZE_BROWSER_WINDOW=true` - see below.
-- `AUTO_TRANSCRIBE=true` + `WHISPER_MODEL` - see below.
+- `MINIMIZE_BROWSER_WINDOW=true` - see "Window visibility" below.
+- Transcription: enable in the Web UI (Settings + Record toggle), or set saved config via `/config`.
+  Optional env overrides: `AUTO_TRANSCRIBE`, `TRANSCRIPTION_ENGINE`, `TRANSCRIPTION_MODEL`, `PYTHON_PATH`.
 
 ## Window visibility
 
-There's no Xvfb equivalent on Windows - a headed browser here means a real, visible window
-on the person's actual desktop, which wasn't a concern before. Two options, in increasing
-order of effort:
+A headed browser means a real Chromium window on the desktop.
 
 1. **Leave it visible (default).** Simple, and it's the configuration the join flow has
    actually been exercised in. You'll see a Chromium window pop up.
@@ -123,25 +115,19 @@ A "run with no visible window at all" option (a separate hidden Windows session/
 would be the next step up if minimizing isn't good enough, but that's real added complexity
 and deliberately out of scope here.
 
-## Whisper / faster-whisper: you already have this, and it already works
+## Post-meeting transcription (optional)
 
-`transcribe/transcribe_with_names.py` + `transcribe.ps1` already exist in this repo, already
-run natively on Windows (that's what the `KMP_DUPLICATE_LIB_OK` / isolated-venv handling in
-there is specifically for - it's dodging a real Windows/Anaconda OpenMP DLL conflict), and
-already produce a **better** result than a new live Node.js Whisper pipeline would: verbatim
-Whisper text, but labeled with real speaker names, by time-aligning Whisper's segments
-against the same `.captions.json` the bot always writes. A fresh `nodejs-whisper`/WASAPI
-pipeline would give you verbatim text with no speaker names at all, which is strictly worse
-for a project whose whole point is "transcript **with speaker names**" - so rebuilding it
-was deliberately skipped. See the main writeup in chat for the fuller reasoning.
+`transcribe/transcribe_with_names.py` merges verbatim STT output with Teams speaker names from
+`.captions.json`. The Web UI detects engines already installed in Python (Settings →
+Transcription) and can run the script automatically when **More Accurate Transcription** is on.
 
-The only thing added here is a **fully optional** hook to run that existing script
-automatically instead of by hand: set `AUTO_TRANSCRIBE=true` (Windows-only) and the bot will
-fire `transcribe_with_names.py` in the background right after a recording finishes, using
-whatever venv already exists at `transcribe/.venv` (create it once, per the header of
-`transcribe.ps1`). It doesn't block `/leave` - a real transcription pass can take minutes on
-CPU - it just runs and logs when it's done. Leave `AUTO_TRANSCRIBE` unset to keep doing this
-by hand exactly as before.
+Manual run:
+
+```powershell
+python transcribe\transcribe_with_names.py ..\Recordings\<name>.wav --engine faster_whisper --model small
+```
+
+Or use `transcribe\transcribe.ps1` if you use a local venv for development.
 
 ## Known things worth testing early on real hardware
 
@@ -160,9 +146,3 @@ by hand exactly as before.
   Nothing here is unusual for browser automation, but automated Chromium plus a background
   audio-capture helper is a pattern security tooling sometimes inspects more closely than a
   normal app install.
-
-## What deliberately did NOT change
-
-`Dockerfile`, `docker-compose.yml`, and `start.sh` are untouched - the Docker/Linux path
-still works as-is for any machine that *can* run it (your own dev box, a server, CI, etc.).
-This adds a second, parallel way to run the same bot; it doesn't replace the first.

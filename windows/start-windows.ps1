@@ -4,16 +4,9 @@
   the entry point for the AVD-restricted-laptop deployment.
 
 .DESCRIPTION
-  start.sh's job on Linux was: bring up Xvfb, bring up PulseAudio + the virtual sink, bring
-  up x11vnc, then start the bot. None of the first three exist here - Windows already has a
-  real desktop and real audio devices, so this script's job is much smaller:
-
-    1. Confirm Node.js is on PATH.
-    2. Confirm the compiled WASAPI capture helper exists (point at build-helper.ps1 if not -
-       recording won't work without it, but captions/transcript still will).
-    3. Make sure the Recordings directory exists.
-    4. Build the TypeScript if build/ looks stale (or -Force is passed).
-    5. Start the bot's HTTP API (default port 3000).
+  Entry point for native Windows runs. Confirms Node (or portable bundle), WASAPI helper,
+  Recordings folder, optional TypeScript build, then starts the HTTP API (default port 3000,
+  with automatic fallback to 3001 / 3847 if busy).
 
 .PARAMETER Force
   Rebuild TypeScript even if build/ looks up to date.
