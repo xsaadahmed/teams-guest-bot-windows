@@ -1,6 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+export type TranscriptionEngineId = 'faster_whisper' | 'parakeet';
+
 export interface UserConfig {
   /** Your Teams display name — used for mute-gated mic capture. */
   localParticipantName: string;
@@ -10,6 +12,13 @@ export interface UserConfig {
   llmApiKey: string;
   /** Default completion model when the UI is set to Auto. */
   llmModel: string;
+  /** Run post-meeting ASR (named transcript) when a recording finishes. */
+  transcriptionEnabled: boolean;
+  transcriptionEngine: TranscriptionEngineId | '';
+  transcriptionModel: string;
+  /** Python interpreter where the selected engine was detected. */
+  transcriptionPythonPath: string;
+  transcriptionDevice: 'cpu' | 'cuda';
 }
 
 export interface EffectiveLlmConfig {
@@ -33,7 +42,20 @@ const DEFAULTS: UserConfig = {
   llmGatewayUrl: '',
   llmApiKey: '',
   llmModel: '',
+  transcriptionEnabled: false,
+  transcriptionEngine: '',
+  transcriptionModel: '',
+  transcriptionPythonPath: '',
+  transcriptionDevice: 'cpu',
 };
+
+export interface EffectiveTranscriptionConfig {
+  enabled: boolean;
+  engine: TranscriptionEngineId | '';
+  model: string;
+  pythonPath: string;
+  device: 'cpu' | 'cuda';
+}
 
 export function getConfigPath(): string {
   return CONFIG_PATH;
@@ -47,11 +69,19 @@ export function loadUserConfig(): UserConfig {
   try {
     if (!fs.existsSync(CONFIG_PATH)) return { ...DEFAULTS };
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) as Partial<UserConfig>;
+    const engineRaw = trimString(raw.transcriptionEngine);
+    const deviceRaw = trimString(raw.transcriptionDevice);
     return {
       localParticipantName: trimString(raw.localParticipantName),
       llmGatewayUrl: trimString(raw.llmGatewayUrl),
       llmApiKey: trimString(raw.llmApiKey),
       llmModel: trimString(raw.llmModel),
+      transcriptionEnabled: Boolean(raw.transcriptionEnabled),
+      transcriptionEngine:
+        engineRaw === 'faster_whisper' || engineRaw === 'parakeet' ? engineRaw : '',
+      transcriptionModel: trimString(raw.transcriptionModel),
+      transcriptionPythonPath: trimString(raw.transcriptionPythonPath),
+      transcriptionDevice: deviceRaw === 'cuda' ? 'cuda' : 'cpu',
     };
   } catch (err) {
     console.warn('[userConfig] Could not read config, using defaults:', err);
@@ -131,6 +161,35 @@ export function isLlmConfigured(): boolean {
   return Boolean(gatewayUrl && apiKey);
 }
 
+function envTranscriptionEnabled(): boolean | null {
+  const v = process.env.AUTO_TRANSCRIBE?.trim().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'yes') return true;
+  if (v === '0' || v === 'false' || v === 'no') return false;
+  return null;
+}
+
+/** Saved config + optional env overrides for IT-managed deployments. */
+export function getEffectiveTranscriptionConfig(): EffectiveTranscriptionConfig {
+  const file = loadUserConfig();
+  const envEnabled = envTranscriptionEnabled();
+  const envEngine = trimString(process.env.TRANSCRIPTION_ENGINE);
+  const envModel = trimString(process.env.TRANSCRIPTION_MODEL);
+  const envPython = trimString(process.env.PYTHON_PATH);
+
+  const engine: TranscriptionEngineId | '' =
+    envEngine === 'faster_whisper' || envEngine === 'parakeet'
+      ? envEngine
+      : file.transcriptionEngine;
+
+  return {
+    enabled: envEnabled ?? file.transcriptionEnabled,
+    engine,
+    model: envModel || file.transcriptionModel,
+    pythonPath: envPython || file.transcriptionPythonPath,
+    device: file.transcriptionDevice,
+  };
+}
+
 /** Mask an API key for display (never sent in full to the browser). */
 export function maskApiKey(key: string): string | null {
   const k = key.trim();
@@ -193,6 +252,38 @@ export function saveUserConfig(partial: Partial<UserConfig>): UserConfig {
       throw new Error('LLM model is set via the LLM_MODEL environment variable.');
     }
     next.llmModel = typeof partial.llmModel === 'string' ? partial.llmModel.trim() : '';
+  }
+
+  if (partial.transcriptionEnabled !== undefined) {
+    next.transcriptionEnabled = Boolean(partial.transcriptionEnabled);
+  }
+
+  if (partial.transcriptionEngine !== undefined) {
+    const e = typeof partial.transcriptionEngine === 'string' ? partial.transcriptionEngine.trim() : '';
+    next.transcriptionEngine =
+      e === 'faster_whisper' || e === 'parakeet' ? e : '';
+  }
+
+  if (partial.transcriptionModel !== undefined) {
+    next.transcriptionModel =
+      typeof partial.transcriptionModel === 'string' ? partial.transcriptionModel.trim() : '';
+  }
+
+  if (partial.transcriptionPythonPath !== undefined) {
+    next.transcriptionPythonPath =
+      typeof partial.transcriptionPythonPath === 'string'
+        ? partial.transcriptionPythonPath.trim()
+        : '';
+  }
+
+  if (partial.transcriptionDevice !== undefined) {
+    const d =
+      typeof partial.transcriptionDevice === 'string' ? partial.transcriptionDevice.trim() : '';
+    next.transcriptionDevice = d === 'cuda' ? 'cuda' : 'cpu';
+  }
+
+  if (next.transcriptionEnabled && !next.transcriptionEngine) {
+    throw new Error('Select a transcription engine before enabling accurate transcription.');
   }
 
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), 'utf8');

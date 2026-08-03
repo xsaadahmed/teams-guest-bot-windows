@@ -37,6 +37,7 @@ import {
   listAvailableModels,
   listSummaries,
   listTranscripts,
+  listTranscriptionEngines,
   pauseRecording,
   resumeRecording,
   positionUiWindow,
@@ -48,6 +49,9 @@ import {
   type RecordingItem,
   type SummaryItem,
   type TranscriptItem,
+  type AvailableTranscriptionEngine,
+  type TranscriptionEnginesResponse,
+  type TranscriptionEngineId,
 } from "../lib/bot-api";
 import { applyTheme, resolveTheme, toggleTheme, type Theme } from "../lib/theme";
 import { cn } from "@/lib/utils";
@@ -1423,6 +1427,209 @@ function LlmSetupBanner({ setPage }: { setPage: (p: Page) => void }) {
   );
 }
 
+function TranscriptionSettingsCard() {
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [engines, setEngines] = useState<TranscriptionEnginesResponse | null>(null);
+  const [engineId, setEngineId] = useState<TranscriptionEngineId | "">("");
+  const [model, setModel] = useState("");
+  const [device, setDevice] = useState<"cpu" | "cuda">("cpu");
+
+  const available = engines?.available ?? [];
+  const hasEngines = available.length > 0;
+
+  const selectedAvailable = available.find((e) => e.id === engineId) ?? available[0];
+  const modelOptions = selectedAvailable?.models ?? [];
+
+  const loadAll = async (refresh = false) => {
+    if (refresh) setRefreshing(true);
+    else setLoading(true);
+    try {
+      const [cfg, detected] = await Promise.all([
+        getBotConfig(),
+        listTranscriptionEngines(refresh),
+      ]);
+      setEngines(detected);
+      const saved = cfg.transcription.saved;
+      setDevice(saved.device === "cuda" ? "cuda" : "cpu");
+
+      const savedEngine = saved.engine;
+      const pick =
+        detected.available.find((e) => e.id === savedEngine) ?? detected.available[0];
+      if (pick) {
+        setEngineId(pick.id);
+        const savedModel = saved.model;
+        setModel(
+          savedModel && pick.models.includes(savedModel) ? savedModel : pick.defaultModel,
+        );
+      } else {
+        setEngineId("");
+        setModel("");
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadAll();
+  }, []);
+
+  const handleEngineChange = (id: string) => {
+    const next = available.find((e) => e.id === id);
+    if (!next) return;
+    setEngineId(next.id);
+    setModel(next.defaultModel);
+  };
+
+  const handleSave = async () => {
+    if (!hasEngines) {
+      toast.error("No transcription engine found on this PC.");
+      return;
+    }
+    if (!selectedAvailable) {
+      toast.error("Select a transcription engine.");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await saveBotConfig({
+        transcriptionEngine: selectedAvailable.id,
+        transcriptionModel: model || selectedAvailable.defaultModel,
+        transcriptionPythonPath: selectedAvailable.pythonPath,
+        transcriptionDevice: device,
+      });
+      toast.success("Transcription settings saved");
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <CardTitle className="text-base">Transcription</CardTitle>
+            <CardDescription>
+              Choose which local STT engine and model to use. Turn it on per meeting from the Record
+              page — the app does not install anything.
+            </CardDescription>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            className="shrink-0"
+            onClick={() => void loadAll(true)}
+            disabled={loading || refreshing}
+            aria-label="Refresh engine detection"
+          >
+            {refreshing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {loading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Detecting installed engines…
+          </div>
+        ) : (
+          <>
+            {!hasEngines ? (
+              <Alert>
+                <Info className="h-4 w-4" />
+                <AlertDescription>
+                  No supported transcription engines were found. Live captions still produce a
+                  transcript. Ask IT to install faster-whisper or NVIDIA NeMo in a Python environment,
+                  then refresh.
+                </AlertDescription>
+              </Alert>
+            ) : null}
+
+            <div className="space-y-2">
+              <Label>Engine</Label>
+              <Select
+                value={engineId || undefined}
+                onValueChange={handleEngineChange}
+                disabled={!hasEngines}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="No engine detected" />
+                </SelectTrigger>
+                <SelectContent>
+                  {(engines?.supported ?? []).map((row) => (
+                    <SelectItem key={row.id} value={row.id} disabled={!row.installed}>
+                      {row.installed
+                        ? `${row.label}${row.version ? ` (${row.version})` : ""}`
+                        : `${row.label} — not found on this PC`}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {selectedAvailable ? (
+                <p className="text-xs text-muted-foreground truncate" title={selectedAvailable.pythonPath}>
+                  Python: {selectedAvailable.pythonPath}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="space-y-2">
+              <Label>Model</Label>
+              <Select
+                value={model || undefined}
+                onValueChange={setModel}
+                disabled={!hasEngines || modelOptions.length === 0}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select model" />
+                </SelectTrigger>
+                <SelectContent>
+                  {modelOptions.map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-2">
+              <Label>CPU/GPU</Label>
+              <Select value={device} onValueChange={(v) => setDevice(v as "cpu" | "cuda")} disabled={!hasEngines}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="cpu">CPU</SelectItem>
+                  <SelectItem value="cuda">GPU</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <Button onClick={() => void handleSave()} disabled={saving || loading || !hasEngines}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Save transcription settings
+            </Button>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [gatewayUrl, setGatewayUrl] = useState("");
@@ -1648,6 +1855,8 @@ function SettingsPage() {
             )}
           </CardContent>
         </Card>
+
+        <TranscriptionSettingsCard />
 
         <Card>
           <CardContent className="pt-6 space-y-3 text-sm">
@@ -2358,7 +2567,9 @@ function useRecorderContext() {
 
 function useRecorder() {
   const [url, setUrl] = useState("");
-  const [accurate, setAccurate] = useState(() => localStorage.getItem("whisperPref") === "1");
+  const [accurate, setAccurateState] = useState(false);
+  const [transcriptionAvailable, setTranscriptionAvailable] = useState(false);
+  const transcriptionPickRef = useRef<AvailableTranscriptionEngine | null>(null);
   // Default on; remembered so the slider matches the last Record choice.
   const [announceInChat, setAnnounceInChat] = useState(
     () => localStorage.getItem("announceRecordingInChat") !== "0",
@@ -2377,8 +2588,88 @@ function useRecorder() {
   const joinedAtRef = useRef<number | null>(null);
 
   useEffect(() => {
-    localStorage.setItem("whisperPref", accurate ? "1" : "0");
-  }, [accurate]);
+    void (async () => {
+      try {
+        const [cfg, engines] = await Promise.all([getBotConfig(), listTranscriptionEngines()]);
+        const pick =
+          engines.available.find((e) => e.id === cfg.transcription.saved.engine) ??
+          engines.available[0] ??
+          null;
+        transcriptionPickRef.current = pick;
+        const hasEngines = engines.available.length > 0;
+        setTranscriptionAvailable(hasEngines);
+
+        const legacyPref = localStorage.getItem("whisperPref") === "1";
+        const saved = cfg.transcription.saved;
+
+        if (hasEngines && legacyPref && !saved.engine && pick) {
+          await saveBotConfig({
+            transcriptionEnabled: true,
+            transcriptionEngine: pick.id,
+            transcriptionModel: pick.defaultModel,
+            transcriptionPythonPath: pick.pythonPath,
+            transcriptionDevice: saved.device,
+          });
+          localStorage.removeItem("whisperPref");
+          setAccurateState(true);
+          return;
+        }
+
+        setAccurateState(hasEngines && saved.enabled);
+        if (!hasEngines && saved.enabled) {
+          await saveBotConfig({ transcriptionEnabled: false });
+        }
+      } catch {
+        setTranscriptionAvailable(false);
+        setAccurateState(false);
+      }
+    })();
+  }, []);
+
+  const setAccurate = (next: boolean) => {
+    if (!transcriptionAvailable) return;
+
+    void (async () => {
+      if (!next) {
+        setAccurateState(false);
+        try {
+          await saveBotConfig({ transcriptionEnabled: false });
+        } catch (e) {
+          toast.error((e as Error).message);
+        }
+        return;
+      }
+
+      try {
+        const cfg = await getBotConfig();
+        const saved = cfg.transcription.saved;
+        const pick =
+          transcriptionPickRef.current ??
+          (saved.engine
+            ? (await listTranscriptionEngines()).available.find((e) => e.id === saved.engine)
+            : null);
+
+        if (!pick) {
+          toast.error("Pick a transcription engine in Settings first.");
+          return;
+        }
+
+        transcriptionPickRef.current = pick;
+        setAccurateState(true);
+        await saveBotConfig({
+          transcriptionEnabled: true,
+          transcriptionEngine: pick.id,
+          transcriptionModel:
+            saved.model && pick.models.includes(saved.model) ? saved.model : pick.defaultModel,
+          transcriptionPythonPath: pick.pythonPath,
+          transcriptionDevice: saved.device,
+        });
+      } catch (e) {
+        setAccurateState(false);
+        toast.error((e as Error).message);
+      }
+    })();
+  };
 
   useEffect(() => {
     localStorage.setItem("announceRecordingInChat", announceInChat ? "1" : "0");
@@ -2612,6 +2903,7 @@ function useRecorder() {
     setUrl,
     accurate,
     setAccurate,
+    transcriptionAvailable,
     announceInChat,
     setAnnounceInChat,
     mode,
@@ -2685,11 +2977,16 @@ function RecorderPanel({ size = "mini", overlay = false }: { size?: "mini" | "la
                 id="accurate-transcription"
                 checked={r.accurate}
                 onCheckedChange={r.setAccurate}
+                disabled={!r.transcriptionAvailable}
                 className={compact ? "scale-90 origin-left" : undefined}
               />
               <Label
                 htmlFor="accurate-transcription"
-                className={cn("cursor-pointer", compact ? "text-[11px]" : "text-xs")}
+                className={cn(
+                  "cursor-pointer",
+                  compact ? "text-[11px]" : "text-xs",
+                  !r.transcriptionAvailable && "text-muted-foreground cursor-not-allowed",
+                )}
               >
                 More Accurate Transcription
               </Label>
@@ -2701,9 +2998,10 @@ function RecorderPanel({ size = "mini", overlay = false }: { size?: "mini" | "la
                   <span className="sr-only">Transcription info</span>
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="top" className="max-w-[220px] text-center">
-                Will take longer to transcribe and generate summaries and use more RAM and CPU once the
-                meeting ends
+              <TooltipContent side="top" className="max-w-[240px] text-center">
+                {r.transcriptionAvailable
+                  ? "Runs a local STT pass after the meeting ends. Takes longer and uses more RAM/CPU."
+                  : "No transcription engine detected on this PC. Install faster-whisper or NeMo in Python, then check Settings."}
               </TooltipContent>
             </Tooltip>
           </div>

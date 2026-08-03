@@ -2,103 +2,62 @@
 """
 Produce a verbatim, speaker-attributed transcript by combining:
 
-  1. faster-whisper transcription of the recorded .wav  (high-quality, verbatim text)
+  1. ASR transcription of the recorded .wav (faster-whisper or NVIDIA Parakeet)
   2. the real speaker names + timestamps the bot scraped from Teams' live captions
      (saved next to the .wav as <name>.captions.json)
 
-Whisper gives accurate text but no speaker identity; Teams captions give the real speaker name
-for every moment of the meeting. We align them by time overlap, so each Whisper segment is labeled
-with the person Teams says was speaking then.
-
-The bot starts the audio recording and the caption capture at the same instant, so both share the
-same t=0 - that's what makes this time alignment work.
-
 Usage:
     python transcribe_with_names.py path/to/recording.wav
-    python transcribe_with_names.py path/to/recording.wav --model small --device cpu
+    python transcribe_with_names.py path/to/recording.wav --engine faster_whisper --model small
+    python transcribe_with_names.py path/to/recording.wav --engine parakeet --model nvidia/parakeet-tdt-0.6b-v2
 
 Outputs (next to the .wav):
-    <name>.named_transcript.txt    human-readable, e.g.  [00:12] Jane Doe: Let's get started.
-    <name>.named_transcript.json   structured segments with speaker + start/end
+    <name>.named_transcript.txt
+    <name>.named_transcript.json
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
 
-# Anaconda ships its own OpenMP runtime (libiomp5md.dll via MKL/numpy) and so does ctranslate2,
-# the engine faster-whisper runs on. With both loaded, the process aborts with
-# "OMP: Error #15: ... libiomp5md.dll already initialized". Setting this before importing
-# faster-whisper tells the loader to tolerate the duplicate. The venv keeps deps isolated, but
-# Windows can still resolve a stray OpenMP DLL off PATH, so we set this defensively regardless.
+# Anaconda + ctranslate2 OpenMP conflict on Windows — set before importing STT libs.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-
-def load_speaker_intervals(captions_path):
-    """Return a list of (start_s, end_s, speaker) from the bot's captions.json (ms -> seconds)."""
-    if not os.path.exists(captions_path):
-        return []
-    with open(captions_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    intervals = []
-    for entry in data.get("captions", []):
-        start_s = entry.get("tStartMs", 0) / 1000.0
-        end_s = entry.get("tEndMs", entry.get("tStartMs", 0)) / 1000.0
-        # Teams marks a caption line at a single instant for short utterances; give it a small
-        # minimum duration so it can still overlap a Whisper segment.
-        if end_s - start_s < 1.5:
-            end_s = start_s + 1.5
-        intervals.append((start_s, end_s, entry.get("speaker", "Unknown")))
-    intervals.sort(key=lambda x: x[0])
-    return intervals
+from engines.faster_whisper_engine import transcribe as transcribe_faster_whisper
+from engines.parakeet_engine import transcribe as transcribe_parakeet
+from engines.registry import engine_by_id
+from engines.speaker_align import load_speaker_intervals, speaker_for_segment
 
 
-def speaker_for_segment(seg_start, seg_end, intervals):
-    """Pick the speaker whose caption window overlaps this segment the most."""
-    best_speaker = None
-    best_overlap = 0.0
-    for cs, ce, speaker in intervals:
-        overlap = min(seg_end, ce) - max(seg_start, cs)
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_speaker = speaker
-
-    if best_speaker is not None:
-        return best_speaker
-
-    # No overlap (e.g. Whisper heard speech Teams didn't caption): fall back to whoever was the
-    # most recent active speaker at this segment's midpoint.
-    mid = (seg_start + seg_end) / 2.0
-    candidate = None
-    for cs, _ce, speaker in intervals:
-        if cs <= mid:
-            candidate = speaker
-        else:
-            break
-    return candidate or "Unknown"
-
-
-def fmt_ts(seconds):
+def fmt_ts(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Whisper transcription with real Teams speaker names.")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ASR transcription with real Teams speaker names.")
     parser.add_argument("wav", help="Path to the recording .wav file.")
-    parser.add_argument("--model", default="small", help="Whisper model size (tiny/base/small/medium/large-v3).")
+    parser.add_argument("--engine", default="faster_whisper", help="faster_whisper or parakeet.")
+    parser.add_argument("--model", default=None, help="Model id for the selected engine.")
     parser.add_argument("--device", default="cpu", help="cpu or cuda.")
     parser.add_argument(
         "--compute-type",
         default="int8",
-        help="ctranslate2 compute type (int8 for CPU, float16 for GPU).",
+        help="ctranslate2 compute type for faster-whisper (int8 for CPU, float16 for GPU).",
     )
-    parser.add_argument("--language", default=None, help="Force a language code (e.g. en); default auto-detect.")
+    parser.add_argument("--language", default=None, help="Force a language code (faster-whisper only).")
     args = parser.parse_args()
 
     if not os.path.exists(args.wav):
         sys.exit(f"WAV not found: {args.wav}")
+
+    spec = engine_by_id(args.engine)
+    if spec is None:
+        sys.exit(f"Unknown engine: {args.engine}")
+
+    model_name = args.model or spec.default_model
 
     base = os.path.splitext(args.wav)[0]
     captions_path = base + ".captions.json"
@@ -106,41 +65,58 @@ def main():
     if not intervals:
         print(
             f"WARNING: no speaker timeline found at {captions_path} - output will be transcribed "
-            "but every line will be labeled 'Unknown'. Make sure the bot captured captions for this "
-            "meeting.",
+            "but every line will be labeled 'Unknown'.",
             file=sys.stderr,
         )
 
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        sys.exit("faster-whisper is not installed. Run:  pip install -r requirements.txt")
-
-    print(f"Loading Whisper model '{args.model}' ({args.device}/{args.compute_type})...", file=sys.stderr)
-    model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
-
-    print("Transcribing (this can take a while on CPU)...", file=sys.stderr)
-    segments, info = model.transcribe(args.wav, vad_filter=True, language=args.language)
+    if args.engine == "faster_whisper":
+        segments, meta = transcribe_faster_whisper(
+            args.wav,
+            model_name,
+            device=args.device,
+            compute_type=args.compute_type,
+            language=args.language,
+        )
+    elif args.engine == "parakeet":
+        segments, meta = transcribe_parakeet(args.wav, model_name, device=args.device)
+    else:
+        sys.exit(f"Engine not implemented: {args.engine}")
 
     results = []
     lines = []
     for seg in segments:
-        speaker = speaker_for_segment(seg.start, seg.end, intervals)
-        text = seg.text.strip()
+        speaker = speaker_for_segment(seg["start"], seg["end"], intervals)
+        text = seg["text"].strip()
         if not text:
             continue
-        results.append({"start": seg.start, "end": seg.end, "speaker": speaker, "text": text})
-        lines.append(f"[{fmt_ts(seg.start)}] {speaker}: {text}")
+        results.append({"start": seg["start"], "end": seg["end"], "speaker": speaker, "text": text})
+        lines.append(f"[{fmt_ts(seg['start'])}] {speaker}: {text}")
 
     txt_path = base + ".named_transcript.txt"
     json_path = base + ".named_transcript.json"
 
-    header = f"--- Verbatim transcript (Whisper '{args.model}') with Teams speaker names ---\n"
-    header += f"Detected language: {info.language} (p={info.language_probability:.2f})\n\n"
+    engine_label = spec.label
+    header = f"--- Verbatim transcript ({engine_label} '{model_name}') with Teams speaker names ---\n"
+    if meta.get("language") is not None:
+        prob = meta.get("language_probability")
+        if prob is not None:
+            header += f"Detected language: {meta['language']} (p={prob:.2f})\n"
+    header += "\n"
+
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(lines) + "\n")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"language": info.language, "segments": results}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "engine": meta.get("engine", args.engine),
+                "model": model_name,
+                "language": meta.get("language"),
+                "segments": results,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     print(f"\nDone. Wrote:\n  {txt_path}\n  {json_path}")
 

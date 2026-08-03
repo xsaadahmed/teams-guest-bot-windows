@@ -1,10 +1,11 @@
 import express, { Request, Response } from 'express';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
 import { TeamsGuestBot } from './bot';
 import { applyUiWindowLayout } from './uiWindow';
-import { bootstrapUserConfig, getLocalParticipantName, getEffectiveLlmConfig, isLlmConfigured, maskApiKey, saveUserConfig } from './userConfig';
+import { bootstrapUserConfig, getLocalParticipantName, getEffectiveLlmConfig, getEffectiveTranscriptionConfig, isLlmConfigured, loadUserConfig, maskApiKey, saveUserConfig } from './userConfig';
 import {
   findSummaryByTranscript,
   generateSummaryForTranscript,
@@ -14,6 +15,11 @@ import {
 import { checkLLMConnection, listAvailableModels, resetLlmClient } from './llmClient';
 import { getWavDurationMs } from './wavTrim';
 import { isRosterAutomationEnabled } from './teamsJoin';
+import {
+  discoverTranscriptionEngines,
+  invalidateTranscriptionEnginesCache,
+  isValidTranscriptionEngineId,
+} from './transcriptionEngines';
 
 bootstrapUserConfig();
 {
@@ -64,7 +70,49 @@ function openWebUiWindow(port: number): void {
   tryNext(0);
 }
 
-const PORT = Number(process.env.PORT || 3000);
+/** Preferred port first, then 3001, then a less common fallback. */
+function getPortCandidates(): number[] {
+  const preferred = Number(process.env.PORT || 3000);
+  const fallbacks = [3001, 3847];
+  const seen = new Set<number>();
+  const candidates: number[] = [];
+  for (const port of [preferred, ...fallbacks]) {
+    if (!Number.isFinite(port) || port < 1 || port > 65535 || seen.has(port)) continue;
+    seen.add(port);
+    candidates.push(port);
+  }
+  return candidates;
+}
+
+function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const tester = net.createServer();
+    tester.once('error', () => resolve(false));
+    tester.once('listening', () => {
+      tester.close(() => resolve(true));
+    });
+    tester.listen(port, '127.0.0.1');
+  });
+}
+
+async function resolveListenPort(candidates: number[]): Promise<number> {
+  for (let i = 0; i < candidates.length; i++) {
+    const port = candidates[i];
+    if (await isPortAvailable(port)) {
+      if (i > 0) {
+        console.warn(
+          `[server] Port ${candidates[0]} is in use — using ${port} instead.`,
+        );
+      }
+      return port;
+    }
+    if (i < candidates.length - 1) {
+      console.warn(`[server] Port ${port} is in use, trying next...`);
+    }
+  }
+  throw new Error(`All candidate ports are in use: ${candidates.join(', ')}`);
+}
+
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(process.cwd(), 'Recordings');
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
@@ -85,6 +133,8 @@ app.get('/status', (_req: Request, res: Response) => {
 /** Local user settings (Teams display name, LLM for summarization). */
 function buildConfigResponse() {
   const llm = getEffectiveLlmConfig();
+  const file = loadUserConfig();
+  const transcription = getEffectiveTranscriptionConfig();
   return {
     localParticipantName: getLocalParticipantName(),
     botDisplayName: process.env.DEFAULT_DISPLAY_NAME || 'e& Assistant',
@@ -96,6 +146,20 @@ function buildConfigResponse() {
       apiKeyPreview: maskApiKey(llm.apiKey),
       fromEnv: llm.fromEnv,
       uiOverride: llm.uiOverride,
+    },
+    transcription: {
+      enabled: transcription.enabled,
+      engine: transcription.engine,
+      model: transcription.model,
+      pythonPath: transcription.pythonPath,
+      device: transcription.device,
+      saved: {
+        enabled: file.transcriptionEnabled,
+        engine: file.transcriptionEngine,
+        model: file.transcriptionModel,
+        pythonPath: file.transcriptionPythonPath,
+        device: file.transcriptionDevice,
+      },
     },
   };
 }
@@ -136,6 +200,49 @@ app.put('/config', (req: Request, res: Response) => {
     partial.llmModel = body.llmModel;
   }
 
+  if (body.transcriptionEnabled !== undefined) {
+    if (typeof body.transcriptionEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'transcriptionEnabled must be a boolean.' });
+    }
+    partial.transcriptionEnabled = body.transcriptionEnabled;
+  }
+
+  if (body.transcriptionEngine !== undefined) {
+    if (typeof body.transcriptionEngine !== 'string') {
+      return res.status(400).json({ error: 'transcriptionEngine must be a string.' });
+    }
+    const engine = body.transcriptionEngine.trim();
+    if (engine && !isValidTranscriptionEngineId(engine)) {
+      return res.status(400).json({ error: `Unknown transcription engine: ${engine}` });
+    }
+    partial.transcriptionEngine = engine;
+  }
+
+  if (body.transcriptionModel !== undefined) {
+    if (typeof body.transcriptionModel !== 'string') {
+      return res.status(400).json({ error: 'transcriptionModel must be a string.' });
+    }
+    partial.transcriptionModel = body.transcriptionModel;
+  }
+
+  if (body.transcriptionPythonPath !== undefined) {
+    if (typeof body.transcriptionPythonPath !== 'string') {
+      return res.status(400).json({ error: 'transcriptionPythonPath must be a string.' });
+    }
+    partial.transcriptionPythonPath = body.transcriptionPythonPath;
+  }
+
+  if (body.transcriptionDevice !== undefined) {
+    if (typeof body.transcriptionDevice !== 'string') {
+      return res.status(400).json({ error: 'transcriptionDevice must be a string.' });
+    }
+    const device = body.transcriptionDevice.trim();
+    if (device !== 'cpu' && device !== 'cuda') {
+      return res.status(400).json({ error: 'transcriptionDevice must be cpu or cuda.' });
+    }
+    partial.transcriptionDevice = device;
+  }
+
   if (Object.keys(partial).length === 0) {
     return res.status(400).json({ error: 'No settings provided.' });
   }
@@ -153,6 +260,13 @@ app.put('/config', (req: Request, res: Response) => {
     ) {
       console.log('[config] LLM settings updated');
     }
+    if (
+      partial.transcriptionEnabled !== undefined ||
+      partial.transcriptionEngine !== undefined ||
+      partial.transcriptionModel !== undefined
+    ) {
+      console.log('[config] Transcription settings updated');
+    }
     res.json(buildConfigResponse());
   } catch (err) {
     res.status(400).json({ error: (err as Error).message });
@@ -165,6 +279,18 @@ app.post('/config/llm/test', async (req: Request, res: Response) => {
     typeof req.body?.model === 'string' && req.body.model.trim() ? req.body.model.trim() : undefined;
   const result = await checkLLMConnection(model);
   res.status(result.ok ? 200 : 400).json(result);
+});
+
+/** Discover STT engines already installed on this machine (import-only probe). */
+app.get('/api/transcription/engines', async (req: Request, res: Response) => {
+  try {
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    if (refresh) invalidateTranscriptionEnginesCache();
+    const result = await discoverTranscriptionEngines({ refresh });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
 });
 
 /**
@@ -475,13 +601,25 @@ app.get('*', (req: Request, res: Response, next) => {
   return next();
 });
 
-app.listen(PORT, () => {
-  console.log(`teams-guest-bot listening on :${PORT}`);
-  console.log(`Web UI: http://localhost:${PORT}`);
-  console.log(`Recordings directory: ${RECORDINGS_DIR}`);
-  if (!isRosterAutomationEnabled()) {
-    console.log('[server] DISABLE_ROSTER_AUTOMATION=1 — bot will not auto-open People (UI debugging).');
+void (async () => {
+  let port: number;
+  try {
+    port = await resolveListenPort(getPortCandidates());
+  } catch (err) {
+    console.error('[server]', (err as Error).message);
+    process.exit(1);
   }
-  // Slight delay so the server is accepting connections before the window loads.
-  setTimeout(() => openWebUiWindow(PORT), 600);
-});
+
+  process.env.PORT = String(port);
+
+  app.listen(port, () => {
+    console.log(`teams-guest-bot listening on :${port}`);
+    console.log(`Web UI: http://localhost:${port}`);
+    console.log(`Recordings directory: ${RECORDINGS_DIR}`);
+    if (!isRosterAutomationEnabled()) {
+      console.log('[server] DISABLE_ROSTER_AUTOMATION=1 — bot will not auto-open People (UI debugging).');
+    }
+    // Slight delay so the server is accepting connections before the window loads.
+    setTimeout(() => openWebUiWindow(port), 600);
+  });
+})();

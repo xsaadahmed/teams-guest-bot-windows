@@ -1,62 +1,71 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getEffectiveTranscriptionConfig } from './userConfig';
 
 /**
- * Optional: fires off the EXISTING transcribe/transcribe_with_names.py (faster-whisper +
- * Teams caption speaker-alignment - already written, already working on Windows via its own
- * isolated venv) against a just-finished recording, in the background.
+ * Optional: fires off transcribe/transcribe_with_names.py against a just-finished recording,
+ * in the background, using the user's configured Python interpreter and STT engine.
  *
- * Deliberately NOT a new pipeline: transcribe_with_names.py already does the specific thing
- * a "port Whisper to Windows" effort would otherwise rebuild, and does it better than a
- * plain Whisper-on-raw-audio pipeline would - it aligns Whisper's verbatim (but anonymous)
- * segments against the same captions.json the bot already writes, so the output keeps real
- * speaker names instead of generic "Speaker 1/2/3" labels. See transcribe/README or the
- * header of transcribe_with_names.py for how the alignment works.
+ * Detect-only: the app never installs packages — transcription runs only when the user has
+ * enabled it and a supported engine was found on their machine at configuration time.
  *
- * Off by default (AUTO_TRANSCRIBE=true to enable) and Windows-only for now, since the venv
- * setup this depends on exists specifically to dodge a Windows-Python/Anaconda OpenMP DLL
- * conflict (see transcribe/transcribe.ps1) - there's no equivalent need or setup on the
- * Docker/Linux path, where this is left as the manual post-hoc step it always was.
- *
- * Deliberately NOT awaited by callers: transcribing a real meeting can take minutes on CPU,
- * and nothing about /leave responding promptly should depend on it finishing.
+ * Deliberately NOT awaited by callers: transcribing a real meeting can take minutes on CPU.
  */
 export function autoTranscribeInBackground(wavPath: string): void {
-  if (process.env.AUTO_TRANSCRIBE !== 'true') return;
-
   if (process.platform !== 'win32') {
-    console.warn('[autoTranscribe] AUTO_TRANSCRIBE is only wired up for the Windows path right now - skipping.');
+    return;
+  }
+
+  const cfg = getEffectiveTranscriptionConfig();
+  if (!cfg.enabled) return;
+
+  if (!cfg.engine || !cfg.model || !cfg.pythonPath) {
+    console.warn(
+      '[autoTranscribe] Accurate transcription is enabled but engine/model/python path is not configured — skipping.',
+    );
+    return;
+  }
+
+  if (!fs.existsSync(cfg.pythonPath)) {
+    console.warn(
+      `[autoTranscribe] Python interpreter not found at ${cfg.pythonPath} — skipping transcription.`,
+    );
     return;
   }
 
   const repoRoot = path.join(__dirname, '..');
   const transcribeDir = path.join(repoRoot, 'transcribe');
-  const venvPython = path.join(transcribeDir, '.venv', 'Scripts', 'python.exe');
   const script = path.join(transcribeDir, 'transcribe_with_names.py');
 
-  if (!fs.existsSync(venvPython)) {
-    console.warn(
-      `[autoTranscribe] AUTO_TRANSCRIBE is on but no venv found at ${venvPython}.\n` +
-        '[autoTranscribe] One-time setup (run from the transcribe/ folder):\n' +
-        '[autoTranscribe]   python -m venv .venv\n' +
-        '[autoTranscribe]   .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt\n' +
-        '[autoTranscribe] Skipping this recording - captions-based transcript is unaffected.',
-    );
-    return;
-  }
-
   if (!fs.existsSync(script)) {
-    console.warn(`[autoTranscribe] AUTO_TRANSCRIBE is on but ${script} doesn't exist - skipping.`);
+    console.warn(`[autoTranscribe] ${script} doesn't exist — skipping.`);
     return;
   }
 
-  const model = process.env.WHISPER_MODEL || 'small';
-  console.log(`[autoTranscribe] Starting background Whisper pass (model="${model}") on ${path.basename(wavPath)}...`);
+  const args = [
+    script,
+    wavPath,
+    '--engine',
+    cfg.engine,
+    '--model',
+    cfg.model,
+    '--device',
+    cfg.device,
+  ];
 
-  const proc = spawn(venvPython, [script, wavPath, '--model', model], {
+  if (cfg.engine === 'faster_whisper') {
+    args.push('--compute-type', cfg.device === 'cuda' ? 'float16' : 'int8');
+  }
+
+  console.log(
+    `[autoTranscribe] Starting background transcription (engine="${cfg.engine}", model="${cfg.model}") on ${path.basename(wavPath)}...`,
+  );
+
+  const proc = spawn(cfg.pythonPath, args, {
     cwd: transcribeDir,
     stdio: 'pipe',
+    windowsHide: true,
   });
 
   proc.stdout.on('data', (d: Buffer) => console.log('[autoTranscribe]', d.toString().trim()));

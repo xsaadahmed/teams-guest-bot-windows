@@ -76,10 +76,28 @@ export interface LlmConfigStatus {
   uiOverride: boolean;
 }
 
+export type TranscriptionEngineId = "faster_whisper" | "parakeet";
+
+export interface TranscriptionConfigStatus {
+  enabled: boolean;
+  engine: TranscriptionEngineId | "";
+  model: string;
+  pythonPath: string;
+  device: "cpu" | "cuda";
+  saved: {
+    enabled: boolean;
+    engine: TranscriptionEngineId | "";
+    model: string;
+    pythonPath: string;
+    device: "cpu" | "cuda";
+  };
+}
+
 export interface BotConfig {
   localParticipantName: string;
   botDisplayName: string;
   llm: LlmConfigStatus;
+  transcription: TranscriptionConfigStatus;
 }
 
 export interface SaveBotConfigInput {
@@ -87,6 +105,49 @@ export interface SaveBotConfigInput {
   llmGatewayUrl?: string;
   llmApiKey?: string;
   llmModel?: string;
+  transcriptionEnabled?: boolean;
+  transcriptionEngine?: TranscriptionEngineId | "";
+  transcriptionModel?: string;
+  transcriptionPythonPath?: string;
+  transcriptionDevice?: "cpu" | "cuda";
+}
+
+export interface AvailableTranscriptionEngine {
+  id: TranscriptionEngineId;
+  label: string;
+  pythonPath: string;
+  pythonVersion: string;
+  version: string | null;
+  models: string[];
+  defaultModel: string;
+}
+
+export interface SupportedTranscriptionEngine {
+  id: TranscriptionEngineId;
+  label: string;
+  installed: boolean;
+  models: string[];
+  defaultModel: string;
+  pythonPath?: string;
+  pythonVersion?: string;
+  version?: string | null;
+}
+
+export interface TranscriptionEnginesResponse {
+  interpreters: Array<{
+    pythonPath: string;
+    pythonVersion: string;
+    engines: Array<{
+      id: TranscriptionEngineId;
+      label: string;
+      installed: boolean;
+      version: string | null;
+      models: string[];
+      defaultModel: string;
+    }>;
+  }>;
+  available: AvailableTranscriptionEngine[];
+  supported: SupportedTranscriptionEngine[];
 }
 
 export function getBotConfig(): Promise<BotConfig> {
@@ -206,6 +267,11 @@ export function fetchSummary(id: string): Promise<SummaryItem> {
 
 export function listAvailableModels(): Promise<string[]> {
   return api<{ models: string[] }>("/api/models").then((r) => r.models);
+}
+
+export function listTranscriptionEngines(refresh = false): Promise<TranscriptionEnginesResponse> {
+  const q = refresh ? "?refresh=1" : "";
+  return api<TranscriptionEnginesResponse>(`/api/transcription/engines${q}`);
 }
 
 /** Manually generate a summary for a transcript (no auto-trigger). */

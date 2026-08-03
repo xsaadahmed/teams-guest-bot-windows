@@ -75,6 +75,6 @@ if not defined PORT set "PORT=3000"
 REM Optional: set DISABLE_ROSTER_AUTOMATION=1 to stop the bot opening the People panel (UI debugging).
 if "%DISABLE_ROSTER_AUTOMATION%"=="1" echo DISABLE_ROSTER_AUTOMATION=1 ^(People panel + mute tracker off^)
 if /i "%DISABLE_ROSTER_AUTOMATION%"=="true" echo DISABLE_ROSTER_AUTOMATION=true ^(People panel + mute tracker off^)
-echo Starting bot server on port %PORT%...
-echo Web UI: http://localhost:%PORT%/
+echo Starting bot server ^(port %PORT%, auto-fallback: 3001, 3847^)...
+echo Web UI opens on the port shown after "listening on".
 "%NODE_EXE%" build\server.js
