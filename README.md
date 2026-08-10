@@ -9,6 +9,10 @@ projects, rather than Microsoft's official Graph Calling SDK.
 This repository is **Windows-native**: WASAPI loopback capture, Playwright Chromium, and a
 local Web UI. No Docker, no WSL2, no virtual display stack.
 
+> **Desktop app (Electron installer):** use the companion repo
+> **[teams-guest-bot-desktop](https://github.com/xsaadahmed/teams-guest-bot-desktop)** for the
+> Windows installer from GitHub Releases. This repo is the portable CLI / corporate git-clone path.
+
 ## Quick start — corporate laptop (portable bundle)
 
 For locked-down laptops that **can** `git clone` from GitHub but **cannot** reach npm,
